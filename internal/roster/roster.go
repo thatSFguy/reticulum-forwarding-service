@@ -234,6 +234,14 @@ func (r *Roster) Hashes() []string {
 	return out
 }
 
+// Len returns the current member count (including paused members). Used
+// to enforce service.max_members.
+func (r *Roster) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.users)
+}
+
 // Resolve finds a user by nickname (case-insensitive) or by a hex prefix
 // of length >= 4. Returns ambiguity error if multiple match.
 func (r *Roster) Resolve(query string) (User, error) {

@@ -44,6 +44,14 @@ type Transport struct {
 // side; we just want to avoid spamming when an unknown sender retransmits.
 const PathRequestDedupWindow = 60 * time.Second
 
+// KnownIdentityCapacity caps the number of cached known identities to
+// prevent a memory-DoS where an attacker on a public mesh broadcasts
+// announces from many fresh identities. When at capacity, the entry with
+// the oldest LastSeen is evicted. The cap is generous — enough for a
+// large active mesh, small enough that even ~150 bytes/entry stays under
+// 1 MB of heap.
+const KnownIdentityCapacity = 4096
+
 // Interface is anything that can ship Reticulum packets in both directions.
 // TCPClient satisfies it; future LoRa or AutoInterface implementations
 // would too.
@@ -154,11 +162,21 @@ func (t *Transport) RequestPath(targetDestHash []byte) error {
 	key := hex.EncodeToString(targetDestHash)
 
 	t.mu.Lock()
-	if last, ok := t.pathRequestsSent[key]; ok && time.Since(last) < PathRequestDedupWindow {
+	now := time.Now()
+	// Sweep expired entries while we're holding the lock — bounds the map
+	// at roughly the number of distinct targets contacted within the dedup
+	// window. Without this, an attacker generating fresh source_hashes
+	// could grow this map without bound.
+	for k, ts := range t.pathRequestsSent {
+		if now.Sub(ts) > PathRequestDedupWindow {
+			delete(t.pathRequestsSent, k)
+		}
+	}
+	if last, ok := t.pathRequestsSent[key]; ok && now.Sub(last) < PathRequestDedupWindow {
 		t.mu.Unlock()
 		return nil
 	}
-	t.pathRequestsSent[key] = time.Now()
+	t.pathRequestsSent[key] = now
 	t.mu.Unlock()
 
 	pkt, err := BuildPathRequest(targetDestHash)
@@ -338,6 +356,19 @@ func (t *Transport) handleAnnounce(p *Packet) {
 		return
 	}
 	if prev == nil {
+		// Bound the map: when at capacity, evict the entry with the oldest
+		// LastSeen. O(N) but only runs at full capacity, which is rare.
+		if len(t.known) >= KnownIdentityCapacity {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range t.known {
+				if oldestKey == "" || v.LastSeen.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.LastSeen
+				}
+			}
+			delete(t.known, oldestKey)
+		}
 		prev = &KnownIdentity{}
 		t.known[key] = prev
 	}

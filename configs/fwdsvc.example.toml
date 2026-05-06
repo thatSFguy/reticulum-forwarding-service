@@ -47,6 +47,12 @@ announce_interval = "10m"
 # format size cap (~280 bytes). Set to 0 to disable.
 max_inbound_chars = 500
 
+# Maximum number of members in the chat. /join attempts past this cap
+# are refused with a "the chat is full" reply; existing and paused
+# members both count toward the limit. Set to 0 (default) for
+# unlimited.
+max_members = 0
+
 # Reticulum I/O interfaces. Currently only "tcp_client" is supported, which
 # dials a TCPServerInterface peer (e.g. a public testnet entry node) and
 # exchanges HDLC-framed packets in both directions. You can list multiple.

@@ -196,6 +196,14 @@ func (d *Dispatcher) handleJoin(c *Caller) string {
 	if d.Roster.IsBanned(c.HashBytes) {
 		return "You're banned from this chat."
 	}
+	// Enforce the configured member cap. Existing + paused members both
+	// count; only fully-removed (kicked / left / pruned) entries free a
+	// slot. Skipped when MaxMembers == 0.
+	if max := d.Cfg.Service.MaxMembers; max > 0 {
+		if cur := d.Roster.Len(); cur >= max {
+			return fmt.Sprintf("Sorry, the chat is full (%d/%d members). Please try again later.", cur, max)
+		}
+	}
 	if _, err := d.Roster.AddOrUpdate(c.HashBytes, time.Now()); err != nil {
 		return "Couldn't join: " + err.Error()
 	}

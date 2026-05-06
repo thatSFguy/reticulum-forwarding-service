@@ -184,6 +184,37 @@ func TestJoinIdempotent(t *testing.T) {
 	}
 }
 
+func TestJoinRespectsMaxMembers(t *testing.T) {
+	d := newDispatcher(t)
+	d.Cfg.Service.MaxMembers = 2
+
+	// Pre-fill 2 members.
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, modHash), time.Now())
+	other := "1111111111111111111111111111111111111111111111111111111111111111"[:32]
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, other), time.Now())
+
+	out := d.Dispatch(userHash, Parse("/join"))
+	if !strings.Contains(strings.ToLower(out), "full") {
+		t.Errorf("expected chat-full denial, got %q", out)
+	}
+	if d.Roster.Has(mustBytes(t, userHash)) {
+		t.Error("user should NOT have been added when chat is full")
+	}
+}
+
+func TestJoinUnlimitedWhenMaxMembersZero(t *testing.T) {
+	d := newDispatcher(t)
+	d.Cfg.Service.MaxMembers = 0
+	for i := 0; i < 5; i++ {
+		hash := strings.Repeat(string(rune('0'+byte(i))), 32)
+		_, _ = d.Roster.AddOrUpdate(mustBytes(t, hash), time.Now())
+	}
+	out := d.Dispatch(userHash, Parse("/join"))
+	if !strings.Contains(strings.ToLower(out), "joined") {
+		t.Errorf("max_members=0 should be unlimited, got %q", out)
+	}
+}
+
 func TestJoinRejectsBanned(t *testing.T) {
 	d := newDispatcher(t)
 	_ = d.Roster.Ban(userHash)

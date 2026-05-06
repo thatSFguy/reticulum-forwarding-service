@@ -40,6 +40,12 @@ type ServiceConfig struct {
 	// policy limit, separate from the wire-format size cap.
 	// 0 = unlimited (not recommended). Default: 500.
 	MaxInboundChars int `toml:"max_inbound_chars"`
+
+	// MaxMembers caps the size of the roster. /join attempts past this
+	// limit are refused with a polite "the chat is full" reply; the
+	// would-be joiner is not added. Existing members and paused members
+	// both count toward the limit. 0 = unlimited (default).
+	MaxMembers int `toml:"max_members"`
 }
 
 // InterfaceConfig declares a single Reticulum I/O interface. Currently
@@ -147,6 +153,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.MaxInboundChars < 0 {
 		return fmt.Errorf("service.max_inbound_chars must be >= 0")
+	}
+	if c.Service.MaxMembers < 0 {
+		return fmt.Errorf("service.max_members must be >= 0")
 	}
 	for i, iface := range c.Interfaces {
 		if iface.Type != "tcp_client" {

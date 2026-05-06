@@ -10,6 +10,16 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+// safeUnmarshalAnnounce wraps msgpack.Unmarshal for inbound
+// attacker-controlled announce app_data. Centralised here so a future
+// stricter cap (e.g. switching msgpack libraries) lands in one place.
+// vmihailenco/msgpack/v5's built-in allocation limit already bounds
+// memory during a single decode, which is the practical defense
+// against decoder bombs.
+func safeUnmarshalAnnounce(data []byte, v any) error {
+	return msgpack.Unmarshal(data, v)
+}
+
 // Announce wire body (SPEC §4.1):
 //
 //	public_key(64) || name_hash(10) || random_hash(10) || [ratchet_pub(32)] || signature(64) || app_data
@@ -246,14 +256,14 @@ func DecodeLXMFAppDataDisplayName(data []byte) ([]byte, error) {
 	}
 	// Try msgpack array first.
 	var arr []msgpack.RawMessage
-	if err := msgpack.Unmarshal(data, &arr); err == nil && len(arr) >= 1 {
+	if err := safeUnmarshalAnnounce(data, &arr); err == nil && len(arr) >= 1 {
 		var name []byte
 		// Element 0 may be bin (preferred) or str.
-		if uerr := msgpack.Unmarshal(arr[0], &name); uerr == nil {
+		if uerr := safeUnmarshalAnnounce(arr[0], &name); uerr == nil {
 			return name, nil
 		}
 		var nameStr string
-		if uerr := msgpack.Unmarshal(arr[0], &nameStr); uerr == nil {
+		if uerr := safeUnmarshalAnnounce(arr[0], &nameStr); uerr == nil {
 			return []byte(nameStr), nil
 		}
 		return nil, errors.New("app_data: first element neither bin nor str")

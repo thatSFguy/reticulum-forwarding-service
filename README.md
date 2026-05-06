@@ -1,270 +1,239 @@
 # reticulum-forwarding-service (`fwdsvc`)
 
-A Reticulum/LXMF group-chat relay written in pure Go, with no third-party
-Reticulum library — implements the protocol layers we need directly from
-[the spec](https://github.com/thatSFguy/reticulum-specifications) and
-verifies wire-format correctness against the upstream Python `rns` + `LXMF`
-reference implementation. Live-tested round-trip with a mobile LXMF client
-over a public testnet entry node.
+A Reticulum/LXMF group-chat relay written in pure Go. Users send LXMF
+messages to the service and it forwards each message to every other
+roster member, creating a many-to-many group chat over any
+Reticulum-supported transport.
 
-Users send LXMF messages to this service and it forwards each message to
-every other roster member, creating a many-to-many group chat. Designed to
-run unattended on small Linux hardware: Debian, Raspberry Pi (arm64/armv7),
-x86_64.
+- **No third-party Reticulum library.** Implements the protocol
+  layers we need directly from
+  [the spec](https://github.com/thatSFguy/reticulum-specifications).
+- **Verified against upstream Python `rns` + `LXMF`** at the byte level
+  (static test vectors plus a live subprocess interop test).
+- **Live-tested end-to-end** with a mobile LXMF client over a public
+  Reticulum testnet entry node.
+- **Single static binary** that runs unattended on small Linux
+  hardware (Debian, Raspberry Pi arm64/armv7), x86_64 servers,
+  Windows, or macOS.
 
-## Wire-format features implemented
+## Quick start
 
-These are the parts of the Reticulum / LXMF protocol stack the service
-currently speaks. Everything here has at least one of: a static test
-vector against canonical Python output, a passing live subprocess
-interop test, or a confirmed live round-trip with a third-party LXMF
-client.
+1. **Download a pre-built binary** from
+   [the latest release](https://github.com/thatSFguy/reticulum-forwarding-service/releases/latest)
+   for your platform (linux-amd64, linux-arm64, linux-armv7, windows-amd64,
+   darwin-arm64). On Linux/macOS, `chmod +x fwdsvc-…`.
 
-- **Identity** — X25519 + Ed25519 keypair, on-disk format, `identity_hash`
-  and `destination_hash` derivation (SPEC §1).
-- **Token cipher** — AES-256-CBC + HMAC-SHA256 + HKDF with `identity_hash`
-  salt (SPEC §3).
-- **Packet header** — HEADER_1 and HEADER_2 codec, including the
-  hashable-part rule that makes proofs survive HEADER_1↔HEADER_2 in flight
-  (SPEC §2).
-- **HDLC framing** for `tcp_client` interfaces (SPEC §8.2).
-- **Announce** — build, parse, verify, with and without ratchet
-  (SPEC §4). `app_data` msgpack `[display_name_bytes, stamp_cost]`
-  including the §9.3 `bin`-vs-`str` gotcha.
-- **Opportunistic LXMF** — full sign/encrypt/decrypt/verify both
-  directions, including the SPEC §5.6 dual-msgpack-variant tolerance
-  for stamp-bearing inbound messages (SPEC §5).
-- **PROOF emission** — every received `CTX_NONE` DATA packet at a
-  SINGLE destination is acknowledged with a 64-byte implicit-form
-  PROOF (SPEC §6.5), so senders' `PacketReceipt`s resolve and they
-  stop retransmitting.
-- **Path requests** — when a message arrives from a sender we can't
-  verify, we issue a `path?` broadcast (SPEC §7.1) and a path-aware
-  relay's path-response announce gives us their public key. Per-target
-  60 s dedup so noisy retransmitters don't make us flood.
-- **HEADER_2 originator conversion** — outbound DATA addressed to a
-  recipient that announced via a relay uses HEADER_2 with the cached
-  next-hop transport_id (SPEC §2.3), so multi-hop recipients actually
-  receive our messages.
+2. **Make a config dir** and copy the example config:
 
-## Behaviour
+   ```sh
+   mkdir -p ~/.fwdsvc
+   curl -L https://raw.githubusercontent.com/thatSFguy/reticulum-forwarding-service/main/configs/fwdsvc.example.toml \
+     -o ~/.fwdsvc/config.toml
+   ```
 
-- **Explicit `/join`.** The first non-command message from a new
-  Reticulum identity gets a private invitation reply explaining the
-  service. The sender's message is not forwarded and they are not added
-  to the roster — they have to send `/join` to opt in. This avoids the
-  awkward "I sent one message and now strangers are getting it" UX.
-- **Replay on join.** New (and returning) members receive the most recent
-  messages so they can pick up the conversation. Defaults: last 100 messages,
-  nothing older than 7 days.
-- **Pause without leaving.** A member can `/pause` to stop receiving
-  forwarded messages (and stop having their own messages forwarded to
-  others). `/resume` reverses it. Roster entry stays put.
-- **Per-message char cap** (`service.max_inbound_chars`, default 500) —
-  oversized non-command messages get rejected with a polite reply,
-  separate from the lower wire-format size limit.
-- **Auto-prune.** Members whose Reticulum identity hasn't announced in
-  4 weeks are removed.
-- **Slash commands** (the `/?` reply is **role-aware** — non-members
-  only see commands that work for them, mods see the moderation set):
+3. **Edit `~/.fwdsvc/config.toml`** — set `display_name`, point at a
+   reachable Reticulum peer in `[[interfaces]]`, leave `admins = []`
+   for now (we'll add yours below). The example config is annotated.
 
-  | Command                   | Who          | Effect                                                            |
-  |---------------------------|--------------|-------------------------------------------------------------------|
-  | `/?` or `/help`           | anyone       | List commands available to you                                    |
-  | `/users`                  | anyone       | List roster (paused members marked `[paused]`)                    |
-  | `/mods`                   | anyone       | List mods                                                         |
-  | `/admin`                  | anyone       | List admins                                                       |
-  | `/join`                   | non-members  | Opt in: receive forwarded messages, your messages get forwarded   |
-  | `/leave`                  | members      | Leave the chat (you can `/join` again later)                      |
-  | `/pause`                  | members      | Stop receiving forwarded messages (and stop forwarding yours)     |
-  | `/resume`                 | members      | Reverse `/pause`                                                  |
-  | `/nick <newname>`         | members      | Change own nickname                                               |
-  | `/nick <user> <newname>`  | mods, admins | Change another user's nickname                                    |
-  | `/kick <user>`            | mods, admins | Remove from roster (user can `/join` again)                       |
-  | `/ban <user>`             | mods, admins | Add to banlist; future `/join`s and messages refused              |
-  | `/unban <user>`           | mods, admins | Remove from banlist                                               |
-  | `/announce`               | mods, admins | Broadcast a fresh announce immediately                            |
-
-  `<user>` accepts a nickname (case-insensitive) or a destination-hash
-  prefix (>=4 hex chars).
-
-## Limitations
-
-The implementation is intentionally minimal — just enough Reticulum + LXMF
-to run a leaf-node group-chat hub. If any of these matter for your
-deployment, the service won't fit as-is.
-
-### Message size
-
-The hard limit comes from upstream `LXMF.LXMessage.ENCRYPTED_PACKET_MAX_CONTENT
-= 295 bytes` (the maximum msgpack payload that fits in a single Reticulum
-DATA packet after Token encryption). Subtracting the LXMF msgpack envelope
-(array tag, float64 timestamp, empty title, content prefix, empty fields
-map) leaves **about 280 bytes for the raw message content** before
-forwarding's `[nickname] ` prefix is added.
-
-After accounting for the prefix, the user-visible budget per message is:
-
-| Sender state                         | Prefix overhead              | Max content (ASCII) |
-|--------------------------------------|------------------------------|---------------------|
-| 8-char hash fallback (no `/nick`)    | `[deadbeef] ` = 11 bytes     | **~269 bytes**      |
-| Short nick, e.g. `bob`               | `[bob] ` = 6 bytes           | **~274 bytes**      |
-| 24-character nick (the maximum)      | `[<24-char-nick>] ` = 27 B   | **~253 bytes**      |
-
-In **characters** (since not all bytes carry one character):
-
-| Content                              | Per char       | Max chars            |
-|--------------------------------------|----------------|----------------------|
-| Pure ASCII / Latin-1 single-byte     | 1 byte         | ~250–275             |
-| Latin diacritics (é, ñ, …)           | 2 bytes        | ~125–135             |
-| CJK / most non-Latin scripts         | 3 bytes        | ~85–90               |
-| Emoji and other 4-byte UTF-8         | 4 bytes        | ~60–70               |
-
-**Behavior on too-long messages:** the service refuses to forward them
-and replies privately to the original sender with a message like
-`Message not delivered: 423 bytes is too long for single-packet relay.
-Your max is roughly 269 bytes (link-based delivery is not implemented
-yet).` The message is **not** appended to history, so other roster
-members never see it.
-
-**Forwarded messages add a `[nickname] ` prefix**, which is what makes
-the practical limit lower than the raw 280-byte cap and why long
-nicknames cost everyone budget.
-
-**No fragmentation / Reticulum Resource transfer.** SPEC §10 resource
-fragmentation isn't implemented; multi-packet messages would require
-link-based delivery, which isn't implemented either.
-
-### Transport
-
-- **Only one interface type: `tcp_client`.** We dial out to a TCP
-  Reticulum peer and exchange HDLC-framed packets. **No LoRa / RNode
-  serial, no UDP, no AutoInterface (LAN multicast), no I2P.** A Pi with
-  a real LoRa modem will need to run upstream `rnsd` alongside `fwdsvc`
-  and let `fwdsvc` connect to `rnsd` over TCP.
-- **No transit relay.** We don't forward third-party packets. Other
-  Reticulum nodes can't route through us.
-- **No automatic reconnect.** If the TCP interface drops, the service
-  logs and continues; you have to restart it. (Use systemd `Restart=on-failure`.)
-- **Path table doesn't persist across restart.** `transport.known` is
-  in-memory only. After a restart, the next message from a previously-known
-  sender triggers a path? request (SPEC §7.1) and the first message from
-  them gets dropped while we wait for the path response. The roster
-  itself, history, and banlist do persist on disk.
-
-### LXMF features deferred
-
-- **No link-based delivery.** Messages requiring an established Reticulum
-  Link (anything over the size limit, or any peer on a high-latency path
-  where opportunistic timeouts) won't work.
-- **No propagation node / store-and-forward.** If a recipient is offline
-  when a message is forwarded to them, the message is **lost from their
-  perspective**. Replay-on-join only kicks in for users joining or
-  rejoining after a kick/prune — it does not cover daily reachability
-  gaps. Long-offline-then-online is not handled.
-- **No ratchets / forward secrecy.** Every Token-encrypted message uses
-  the recipient's long-term X25519 key. If the long-term key is later
-  compromised, all past messages are decryptable. We accept and ignore
-  the `ratchet_pub` field on inbound announces; we never rotate our own.
-- **No stamps / proof-of-work anti-spam.** SPEC §5.7 stamps are not
-  enforced (we accept everything) and not generated (peers requiring
-  stamp-cost > 0 will silently reject our outbound LXMF). Our own
-  announces declare `stamp_cost = 0`.
-- **No tickets** (the pre-shared shortcut around stamp PoW).
-- **No msgpack `fields` content.** Outbound messages always carry an
-  empty fields dict. Inbound parsing accepts and discards any fields
-  present. So no attachments, stickers, embedded LXMs, or telemetry
-  on either direction.
-
-### Identity / trust
-
-- **Trust on first announce (TOFU).** The first signed announce we hear
-  from any destination is taken at face value. SPEC §4.5 step 4 then
-  rejects subsequent attempts to override the public key for that
-  destination — so you can't be silently MitM'd after the first contact,
-  but the first contact has no out-of-band verification.
-- **Lost identities cannot recover the same destination.** Per SPEC, a
-  user who loses their identity material gets a different identity_hash
-  on regeneration → different destination_hash → effectively a new
-  user from our perspective. Their old roster entry will eventually
-  prune; their new one is a fresh join.
-- **Senders MUST announce before messaging.** We can't decrypt to a
-  recipient whose public key we haven't heard, and we can't verify a
-  signature from a sender whose Ed25519 pub we haven't cached. A peer
-  whose first packet is an LXMF (no prior announce) will be rejected.
-
-### Service design
-
-- **Single chat room.** No multi-room support. One process, one roster.
-- **No runtime promotion.** `[admins]` and `[mods]` are config-file only.
-  No `/promote` command. Edit the file and restart to change.
-- **No DM support.** Every non-command message is forwarded to the entire
-  roster. No private message paths.
-- **No edit / delete.** Forwarded messages are immutable; a sender cannot
-  retract or amend.
-- **No reply pagination.** Command replies are sent as a single LXMF
-  packet (~280-byte budget). `/?` and `/help` fit by design (a regression
-  test guards the budget). `/users`, `/mods`, `/admin` produce dynamic
-  output that can in principle exceed the limit if the roster grows large;
-  the send-side `ErrPayloadTooLarge` guard refuses the reply and logs the
-  failure rather than corrupting the wire. Pagination (`/users 1`,
-  `/users 2`, etc.) is a future enhancement.
-
-## Build
-
-Requires Go 1.26 or newer.
-
-If you don't have Go installed yet:
-
-- **Windows:** download the `.msi` from https://go.dev/dl/ and run it.
-  After install, open a fresh PowerShell and confirm `go version` works.
-- **Debian / Ubuntu:** `sudo apt install golang-go` (check version is >= 1.26;
-  if not, install from https://go.dev/dl/).
-- **Raspberry Pi:** prefer cross-compiling from a development machine.
-
-First-time build:
-
-```sh
-go mod tidy
-go build -o fwdsvc ./cmd/fwdsvc
-go test ./...
-```
-
-Cross-compile for Raspberry Pi:
-
-```sh
-GOOS=linux GOARCH=arm64 go build -o fwdsvc-arm64 ./cmd/fwdsvc        # Pi 4/5
-GOOS=linux GOARCH=arm GOARM=7 go build -o fwdsvc-armv7 ./cmd/fwdsvc  # Pi 2/3/Zero 2
-```
-
-Or use `scripts/build-rpi.sh`.
-
-## Run
-
-1. Copy `configs/fwdsvc.example.toml` to `~/.fwdsvc/config.toml` and edit:
-   - Set `display_name` to whatever you want users to see in announces.
-   - Set at least one `[[interfaces]]` entry with `type = "tcp_client"`
-     pointing at a reachable Reticulum peer (e.g. `rns.michmesh.net:7822`
-     is one community-run testnet entry node, or use a local `rnsd` if
-     you're running one).
-   - Add the identity hash of at least one admin to `admins = [...]`.
-     (You can run the service once first, copy the printed identity hash,
-     then add it.)
-2. Run it:
+4. **Run it once** to generate an identity:
 
    ```sh
    ./fwdsvc -config ~/.fwdsvc/config.toml
    ```
 
-   On first run the service generates its identity at `identity_path` and
-   prints its destination hash on stdout. Share that hash with the people
-   who should be able to message the service.
+   The first lines on stdout will be:
 
-This service does **not** read `~/.reticulum/config` — it implements the
-Reticulum protocol itself, so the `[[interfaces]]` block in
-`config.toml` is the entire interface config.
+   ```
+   fwdsvc 1.0.1 starting (linux/amd64)
+   fwdsvc 2026/05/06 16:00:00 interface tcp_client connected: …
+   fwdsvc 2026/05/06 16:00:00 service identity hash: 359fc3967f984a529874d0960c6ee782
+   fwdsvc 2026/05/06 16:00:00 delivery destination : 4c87fb86ccfdff39a3d1e22060ba1789
+   ```
 
-## Storage layout
+   The **delivery destination** (second hash) is what people will
+   message in their LXMF client. Share that with your group.
+
+5. **Add yourself as admin.** From your LXMF client (Sideband, your
+   own mobile-app, etc.) send the service a message — anything will
+   do. Watch the log; you'll see:
+
+   ```
+   new sender contact: full dest_hash = 0b0501efed0844bb064bc6df4cba43bb
+   ```
+
+   Stop the service (Ctrl-C), put that 32-character hex string into
+   `admins` in `config.toml`, and restart. You're now an admin.
+
+   ```toml
+   admins = [
+     "0b0501efed0844bb064bc6df4cba43bb",
+   ]
+   ```
+
+6. **From the LXMF client send `/join`** to opt in. Then `/?` to see
+   your commands. Your friends do the same against the same delivery
+   destination hash and they're all in the chat.
+
+## Behaviour
+
+- **Explicit `/join`** — first non-command message from a new sender
+  gets a private invitation reply explaining the service. The message
+  is **not** forwarded and the sender is **not** added to the roster
+  until they explicitly send `/join`. Avoids the "I sent one test
+  message and now strangers are getting it" UX.
+- **Replay on join.** New (and returning) members receive the most
+  recent buffered messages so they can pick up the conversation.
+  Defaults: last 100 messages, nothing older than 7 days. Configurable.
+- **Pause without leaving.** A member can `/pause` to stop receiving
+  forwarded messages (their own messages also stop being forwarded
+  while paused). `/resume` reverses it. The roster entry stays put.
+- **Per-message char cap** (`service.max_inbound_chars`, default 500)
+  rejects oversized non-command messages with a polite reply, separate
+  from the lower wire-format size limit.
+- **Auto-prune.** Members whose Reticulum identity hasn't announced or
+  messaged in 4 weeks are removed.
+- **Forwarded content sanitised.** Bytes outside the printable +
+  whitespace range (TAB/LF/CR) are replaced with `?` before forwarding,
+  so a sender can't inject ANSI escape sequences that would mess up
+  receivers' terminal displays.
+
+## Commands
+
+The `/?` reply is **role-aware** — non-members only see commands that
+work for them, mods see the moderation set.
+
+| Command                   | Who          | Effect                                                            |
+|---------------------------|--------------|-------------------------------------------------------------------|
+| `/?` or `/help`           | anyone       | List commands available to you                                    |
+| `/users`                  | anyone       | List roster (paused members marked `[paused]`)                    |
+| `/mods`                   | anyone       | List configured mods                                              |
+| `/admin`                  | anyone       | List configured admins                                            |
+| `/join`                   | non-members  | Opt in: receive forwarded messages, your messages get forwarded   |
+| `/leave`                  | members      | Leave the chat (you can `/join` again later)                      |
+| `/pause`                  | members      | Stop receiving forwarded messages (and stop forwarding yours)     |
+| `/resume`                 | members      | Reverse `/pause`                                                  |
+| `/nick <newname>`         | members      | Change own nickname (1–24 chars from `[A-Za-z0-9_-]`)             |
+| `/nick <user> <newname>`  | mods, admins | Change another user's nickname                                    |
+| `/kick <user>`            | mods, admins | Remove from roster (user can `/join` again)                       |
+| `/ban <user>`             | mods, admins | Add to banlist; future `/join`s and messages refused              |
+| `/unban <user>`           | mods, admins | Remove from banlist                                               |
+| `/announce`               | mods, admins | Broadcast a fresh Reticulum announce immediately                  |
+
+`<user>` accepts a nickname (case-insensitive) or a destination-hash
+prefix (≥4 hex chars).
+
+## Configuration
+
+The config is a single TOML file. Default location is
+`~/.fwdsvc/config.toml`; override with `-config <path>`.
+
+```toml
+# admins / mods are LXMF DESTINATION hashes (16 raw bytes / 32 hex
+# chars, the lxmf.delivery destination hash of the user's identity —
+# NOT the raw identity hash).
+#
+# Find a user's destination hash: have them send the service ANY
+# message. The forwarder logs `new sender contact: full dest_hash =
+# <32 hex chars>` on first contact. Copy that into the list and
+# restart.
+#
+# IMPORTANT: admins / mods MUST be at the TOP of the file, before any
+# [section] header — TOML scopes top-level keys to whichever section
+# is currently active, so admins/mods after a section get silently
+# parsed under that section instead of at the root.
+admins = [
+  # "0b0501efed0844bb064bc6df4cba43bb",   # your dest_hash here
+]
+mods = [
+  # "ffeeddccbbaa99887766554433221100",
+]
+
+[service]
+# Shown in our LXMF announces. Visible to all Reticulum nodes.
+display_name = "Forwarder"
+
+# Where the service stores its identity, roster, and replay buffer.
+# Tilde is expanded.
+identity_path = "~/.fwdsvc/identity"
+state_path    = "~/.fwdsvc/state.json"
+history_path  = "~/.fwdsvc/history.json"
+
+# Drop a member from the roster if we haven't heard an announce or
+# message from them in this long. Defaults to 4 weeks.
+prune_after = "4w"
+
+# How often to run the prune sweep.
+prune_interval = "1h"
+
+# How often to re-broadcast our own announce so other Reticulum
+# nodes can learn / refresh our path. Upstream Python rnsd uses
+# 5–15 minutes; 30s is fine for a small relay.
+announce_interval = "10m"
+
+# Maximum number of UTF-8 characters allowed in an inbound non-
+# command message. Anything longer is rejected with a polite reply
+# and not forwarded. Spam-prevention policy limit, separate from the
+# lower wire-format size cap (~280 bytes after [nick] prefix).
+# Set to 0 to disable.
+max_inbound_chars = 500
+
+# Maximum number of members in the chat. /join attempts past this cap
+# are refused with a "the chat is full" reply. Existing and paused
+# members both count toward the limit. 0 = unlimited (default).
+max_members = 0
+
+[[interfaces]]
+# How fwdsvc reaches the rest of the Reticulum mesh. We currently
+# only support tcp_client (dial out to a TCPServerInterface peer).
+# The peer can be a community-run testnet node, your own rnsd, or
+# any other reachable Reticulum endpoint.
+type = "tcp_client"
+addr = "rns.michmesh.net:7822"
+# Optional dial timeout; 0 = stdlib default (~30s).
+timeout = "10s"
+
+# Multiple interfaces are supported — fwdsvc broadcasts on all of
+# them. Useful if you want both a community testnet node and a local
+# rnsd you're running.
+#[[interfaces]]
+#type = "tcp_client"
+#addr = "10.0.0.42:4242"
+
+[replay]
+# When a new (or returning) user joins, replay this many recent
+# messages to them, skipping anything older than max_age. Set
+# count = 0 to disable replay entirely.
+count   = 100
+max_age = "7d"
+```
+
+### Setting admins and mods (step-by-step)
+
+The friction here is that you need each admin/mod's **destination
+hash**, which only their LXMF client knows. The simplest workflow:
+
+1. Start `fwdsvc` with `admins = []`.
+2. Have the prospective admin send the service a message from their
+   LXMF client (any message — they'll get a "Welcome…/join" invitation
+   back, that's expected on first contact).
+3. The forwarder logs:
+   ```
+   fwdsvc 2026/05/06 14:24:11 new sender contact: full dest_hash = 0b0501efed0844bb064bc6df4cba43bb
+   ```
+4. Stop the service (Ctrl-C). Add the hex string to `admins` (or `mods`):
+   ```toml
+   admins = [
+     "0b0501efed0844bb064bc6df4cba43bb",
+   ]
+   ```
+5. Restart. The admin now sees mod commands in `/?` and can `/announce`,
+   `/kick`, `/ban`, etc.
+
+To **remove** an admin/mod, edit the config and restart. Admin/mod
+membership is config-only on day one — there's no `/promote` runtime
+command (avoidable but explicit by design — config edits are auditable).
+
+### Storage layout
 
 Default state directory is `~/.fwdsvc/`:
 
@@ -272,36 +241,163 @@ Default state directory is `~/.fwdsvc/`:
 |----------------|-----------------------------------------------------------|
 | `config.toml`  | The config file (you create this).                        |
 | `identity`     | The service's 64-byte Reticulum identity (do not share).  |
-| `state.json`   | Roster + banlist.                                         |
+| `state.json`   | Roster + banlist. Atomic writes; safe across crashes.     |
 | `history.json` | Recent-message ring buffer for replay-on-join.            |
+
+## Wire-format features implemented
+
+These are the parts of the Reticulum / LXMF stack the service speaks.
+Every item below has at least one of: a static byte-level test vector
+against canonical Python output, a passing live subprocess interop
+test against `rns 1.2.0` + `LXMF 0.9.6`, or a confirmed live round-trip
+with a third-party LXMF client.
+
+- **Identity** — X25519 + Ed25519 keypair, on-disk format, identity_hash
+  and destination_hash derivation (SPEC §1).
+- **Token cipher** — AES-256-CBC + HMAC-SHA256 + HKDF-SHA256 with the
+  `identity_hash` salt gotcha (SPEC §3).
+- **Packet header** — HEADER_1 / HEADER_2 codec including the
+  hashable-part rule that makes proofs survive HEADER_1↔HEADER_2 in
+  flight (SPEC §2).
+- **HDLC framing** — for `tcp_client` interfaces (SPEC §8.2).
+- **Announce** — build, parse, verify (with and without ratchet),
+  including the SPEC §9.3 msgpack `bin`-vs-`str` gotcha for
+  `app_data`.
+- **Opportunistic LXMF** — full sign / encrypt / decrypt / verify in
+  both directions, including SPEC §5.6 dual-msgpack-variant tolerance.
+- **PROOF emission** (SPEC §6.5) — every inbound CTX_NONE DATA at a
+  SINGLE destination is acknowledged with a 64-byte implicit-form
+  proof so senders' `PacketReceipt`s resolve.
+- **Path requests** (SPEC §7.1) — when a sender we can't verify
+  contacts us, we issue a `path?` broadcast; a path-aware relay's
+  path-response announce gives us their public key. Per-target 60 s
+  dedup window with periodic sweep.
+- **HEADER_2 originator conversion** (SPEC §2.3) — outbound DATA to a
+  multi-hop recipient is HEADER_2 with the cached next-hop transport_id
+  so it can actually reach them.
+- **Receive-side Reticulum Link** (SPEC §6) — full LINKREQUEST /
+  LRPROOF handshake (byte-exact against the spec test vector),
+  ECDH+HKDF session keys, link-form Token cipher, link-DATA framing,
+  SPEC §6.5.6 explicit-form 96-byte link PROOFs. This means peers can
+  send us LXMF longer than the ~280-byte opportunistic cap and we'll
+  parse and surface them. (Send-side link selection, KEEPALIVE, and
+  link expiry are still TODO.)
+
+## Limitations
+
+The implementation is intentionally minimal — just enough Reticulum +
+LXMF to run a leaf-node group-chat hub. Notable gaps:
+
+- **Forwarder still sends opportunistic** — though we receive over Link
+  fine, our outbound forward path uses opportunistic single-packet
+  delivery. So messages we forward to roster members are subject to
+  the ~280-byte cap (with `[nick] ` prefix overhead). Long replies
+  (e.g. `/users` against a roster of hundreds) can hit this and be
+  refused.
+- **Single TCP interface type** — `tcp_client` only. No LoRa /
+  RNode-serial, no UDP, no AutoInterface (LAN multicast), no I2P. A
+  Pi with a real LoRa modem will need to run upstream `rnsd`
+  alongside `fwdsvc` and connect `fwdsvc` to `rnsd` over TCP.
+- **No transit relay.** We don't forward third-party packets; we're
+  a leaf node only.
+- **No automatic reconnect.** If the TCP interface drops, the service
+  logs and continues; you have to restart it (use systemd
+  `Restart=on-failure`).
+- **Path table doesn't persist across restart.** First message after
+  restart from a previously-known sender triggers a path? request
+  and is dropped while we wait for the response. Subsequent messages
+  from the same sender succeed.
+- **No ratchets / forward secrecy.** Long-term X25519 key is used for
+  every Token cipher. Future-key compromise means past messages are
+  decryptable.
+- **No stamps / proof-of-work anti-spam.** Peers requiring stamps
+  silently reject our outbound LXMF.
+- **No fields** (attachments, stickers, embedded LXMs, telemetry).
+  Inbound `fields` parsed and discarded; outbound is always empty.
 
 ## Verification
 
-The implementation is checked at three increasingly strong levels:
+Three increasingly strong levels of test:
 
-- **Static byte-level test vectors** — `go test ./...` includes tests
-  that load the canonical Python `rns` 1.2.0 / `LXMF` 0.9.6 wire-byte
-  vectors from `../reticulum-specifications/test-vectors/{identities,
-  announces,lxmf}.json` and assert byte-exact equality on identity
-  derivation, announce build (with and without ratchet), Token
-  decrypt, and LXMF body build. Tests skip cleanly if the spec
-  sibling repo isn't present.
+```sh
+# 1. Default unit + spec test vectors. Static byte-level equality
+#    against canonical Python rns 1.2.0 / LXMF 0.9.6 vectors loaded
+#    from ../reticulum-specifications/test-vectors/ (skipped cleanly
+#    if the spec sibling repo isn't checked out).
+go test ./...
 
-- **Live subprocess interop** — `go test -tags=interop ./tests/interop/...`
-  spawns a Python helper that drives upstream `rns` + `LXMF` directly
-  and exchanges fresh announce + opportunistic-LXMF bytes with the Go
-  code in **both directions**. Requires `pip install rns lxmf` (rns
-  >= 1.2.0, LXMF >= 0.9.6) and `python` on PATH. Skips otherwise.
+# 2. Live Python subprocess interop. Spawns a Python helper that
+#    drives upstream rns + LXMF directly and exchanges fresh
+#    announce + opportunistic-LXMF bytes with the Go code in BOTH
+#    directions. Requires `pip install rns lxmf` and `python` on
+#    PATH. Skipped otherwise.
+go test -tags=interop ./tests/interop/...
+```
 
-- **Live mesh interop with a third-party LXMF client.** During
-  development the service was run against `rns.michmesh.net:7822` and
-  exercised end-to-end with a mobile LXMF client: announce propagation
-  in both directions, opportunistic LXMF send, PROOF emission stopping
-  the mobile's retransmit loop, path-request resolving an unannounced
-  sender, and `/?` round-tripping back to the mobile UI. This is the
-  qualitative check that nothing in our wire format silently breaks
-  when the path involves real relays and asymmetric mesh topology.
+Plus a **live mesh interop check** during development: the service was
+run against a community-run testnet entry node (`rns.michmesh.net`,
+`rns.chicagonomad.net`) and exercised end-to-end with a mobile LXMF
+client — announce propagation, opportunistic LXMF send, PROOF
+emission, path-request resolving an unannounced sender, and `/?`
+round-tripping back to the mobile UI.
+
+## Build from source
+
+Requires Go 1.26 or newer.
+
+```sh
+git clone https://github.com/thatSFguy/reticulum-forwarding-service
+cd reticulum-forwarding-service
+go mod tidy
+go build -o fwdsvc ./cmd/fwdsvc
+go test ./...
+```
+
+Cross-compile for every supported platform:
+
+```sh
+./scripts/build-all.sh
+ls -lh build/
+```
+
+## Running as a systemd service
+
+A minimal `fwdsvc.service`:
+
+```ini
+[Unit]
+Description=Reticulum forwarding service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fwdsvc
+ExecStart=/usr/local/bin/fwdsvc -config /etc/fwdsvc/config.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Adjust paths in `config.toml` (`identity_path`, `state_path`,
+`history_path`) accordingly — `~/` won't expand under a system user
+without `$HOME`.
 
 ## License
 
 MIT.
+
+## Contributing
+
+This implementation tracks
+[the canonical Reticulum/LXMF spec](https://github.com/thatSFguy/reticulum-specifications)
+directly. Wire-format changes should reference the relevant SPEC.md
+section number in the commit message and either include a static test
+vector or pass live interop. See the local `AGENTS.md` (gitignored)
+for the full contributor / agent rules.
+
+Issues that find a discrepancy between this implementation and
+upstream Python `rns` / `LXMF`: please cite the upstream source
+file:line and a runtime reproduction in the report.

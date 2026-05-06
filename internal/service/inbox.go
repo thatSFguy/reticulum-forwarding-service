@@ -83,6 +83,12 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		senderNick = senderHex[:8]
 	}
 
+	// Strip C0 controls + DEL from the forwarded copy so a sender can't
+	// inject ANSI escape sequences (cursor moves, line clears, color
+	// resets) that would mess up receivers' terminals or impersonate
+	// other senders' output.
+	content = sanitizeForward(content)
+
 	body := "[" + senderNick + "] " + content
 
 	// Pre-check that the prefixed body will fit in a single opportunistic

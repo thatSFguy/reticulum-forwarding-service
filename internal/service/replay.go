@@ -22,7 +22,7 @@ func (s *Service) replayHistoryTo(joinerHash []byte, now time.Time) {
 		body := fmt.Sprintf("[replay %s] [%s] %s",
 			humanizeAge(now.Sub(e.At)),
 			e.SenderNick,
-			e.Content,
+			sanitizeForward(e.Content),
 		)
 		if err := s.delivery.Send(joinerHash, nil, []byte(body), nil); err != nil {
 			s.logger.Printf("replay send to %x: %v", joinerHash[:4], err)

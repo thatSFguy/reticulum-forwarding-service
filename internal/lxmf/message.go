@@ -16,6 +16,17 @@ import (
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
 )
 
+// safeUnmarshal wraps msgpack.Unmarshal for inbound attacker-controlled
+// payloads. All receive-path decodes route through this; today it is a
+// thin wrapper because vmihailenco/msgpack/v5's default allocation
+// limit (see Decoder.DisableAllocLimit) already caps memory during a
+// single decode, which is the load-bearing defense against decoder
+// bombs. If we ever swap msgpack libraries or want a stricter cap we
+// have one place to change.
+func safeUnmarshal(data []byte, v any) error {
+	return msgpack.Unmarshal(data, v)
+}
+
 // LXMF wire constants (SPEC §5).
 const (
 	signatureLen = 64
@@ -296,7 +307,7 @@ func buildSignedData(destHash, sourceHash, msgpackPayload []byte) []byte {
 // unpackPayload extracts Timestamp/Title/Content/Fields/Stamp from rawPayload.
 func (m *Message) unpackPayload() error {
 	var elems []msgpack.RawMessage
-	if err := msgpack.Unmarshal(m.rawPayload, &elems); err != nil {
+	if err := safeUnmarshal(m.rawPayload, &elems); err != nil {
 		return fmt.Errorf("decode payload array: %w", err)
 	}
 	if len(elems) < 4 {
@@ -304,33 +315,33 @@ func (m *Message) unpackPayload() error {
 	}
 
 	var tsSeconds float64
-	if err := msgpack.Unmarshal(elems[0], &tsSeconds); err != nil {
+	if err := safeUnmarshal(elems[0], &tsSeconds); err != nil {
 		return fmt.Errorf("decode timestamp: %w", err)
 	}
 	whole, frac := splitSeconds(tsSeconds)
 	m.Timestamp = time.Unix(whole, frac).UTC()
 
-	if err := msgpack.Unmarshal(elems[1], &m.Title); err != nil {
+	if err := safeUnmarshal(elems[1], &m.Title); err != nil {
 		// Tolerate msgpack str — some implementations write title as str.
 		var titleStr string
-		if err2 := msgpack.Unmarshal(elems[1], &titleStr); err2 == nil {
+		if err2 := safeUnmarshal(elems[1], &titleStr); err2 == nil {
 			m.Title = []byte(titleStr)
 		} else {
 			return fmt.Errorf("decode title: %w", err)
 		}
 	}
-	if err := msgpack.Unmarshal(elems[2], &m.Content); err != nil {
+	if err := safeUnmarshal(elems[2], &m.Content); err != nil {
 		var contentStr string
-		if err2 := msgpack.Unmarshal(elems[2], &contentStr); err2 == nil {
+		if err2 := safeUnmarshal(elems[2], &contentStr); err2 == nil {
 			m.Content = []byte(contentStr)
 		} else {
 			return fmt.Errorf("decode content: %w", err)
 		}
 	}
-	if err := msgpack.Unmarshal(elems[3], &m.Fields); err != nil {
+	if err := safeUnmarshal(elems[3], &m.Fields); err != nil {
 		// Some payloads use string-keyed maps; tolerate.
 		var sm map[string]any
-		if err2 := msgpack.Unmarshal(elems[3], &sm); err2 == nil {
+		if err2 := safeUnmarshal(elems[3], &sm); err2 == nil {
 			m.Fields = make(map[any]any, len(sm))
 			for k, v := range sm {
 				m.Fields[k] = v
@@ -340,7 +351,7 @@ func (m *Message) unpackPayload() error {
 		}
 	}
 	if len(elems) >= 5 {
-		_ = msgpack.Unmarshal(elems[4], &m.Stamp) // best-effort; stamp is optional
+		_ = safeUnmarshal(elems[4], &m.Stamp) // best-effort; stamp is optional
 	}
 	return nil
 }
@@ -350,7 +361,7 @@ func (m *Message) unpackPayload() error {
 // signature verification (SPEC §5.6).
 func reencodeFirstFour(payload []byte) ([]byte, error) {
 	var elems []msgpack.RawMessage
-	if err := msgpack.Unmarshal(payload, &elems); err != nil {
+	if err := safeUnmarshal(payload, &elems); err != nil {
 		return nil, err
 	}
 	if len(elems) < 4 {
@@ -359,7 +370,7 @@ func reencodeFirstFour(payload []byte) ([]byte, error) {
 	first4 := make([]any, 4)
 	for i := 0; i < 4; i++ {
 		var raw any
-		if err := msgpack.Unmarshal(elems[i], &raw); err != nil {
+		if err := safeUnmarshal(elems[i], &raw); err != nil {
 			return nil, err
 		}
 		first4[i] = raw
