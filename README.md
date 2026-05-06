@@ -45,16 +45,44 @@ deployment, the service won't fit as-is.
 
 ### Message size
 
-- **Opportunistic single-packet delivery only.** Messages must fit in one
-  Reticulum DATA packet. After Token cipher overhead (32 + 16 + 32 = 80
-  bytes), LXMF body framing (16 + 64 ≈ 96 bytes), msgpack overhead, and
-  the underlying interface MTU, you have **roughly 250–400 bytes of
-  message body**. Longer messages **fail to send** — they don't fall back
-  to link-based delivery, they just error out.
-- **Forwarded messages add a `[nickname] ` prefix**, eating ~10–25 bytes
-  off the recipient's view of the limit.
-- **No fragmentation / Reticulum Resource transfer.** SPEC §10 resource
-  fragmentation isn't implemented.
+The hard limit comes from upstream `LXMF.LXMessage.ENCRYPTED_PACKET_MAX_CONTENT
+= 295 bytes` (the maximum msgpack payload that fits in a single Reticulum
+DATA packet after Token encryption). Subtracting the LXMF msgpack envelope
+(array tag, float64 timestamp, empty title, content prefix, empty fields
+map) leaves **about 280 bytes for the raw message content** before
+forwarding's `[nickname] ` prefix is added.
+
+After accounting for the prefix, the user-visible budget per message is:
+
+| Sender state                         | Prefix overhead              | Max content (ASCII) |
+|--------------------------------------|------------------------------|---------------------|
+| 8-char hash fallback (no `/nick`)    | `[deadbeef] ` = 11 bytes     | **~269 bytes**      |
+| Short nick, e.g. `bob`               | `[bob] ` = 6 bytes           | **~274 bytes**      |
+| 24-character nick (the maximum)      | `[<24-char-nick>] ` = 27 B   | **~253 bytes**      |
+
+In **characters** (since not all bytes carry one character):
+
+| Content                              | Per char       | Max chars            |
+|--------------------------------------|----------------|----------------------|
+| Pure ASCII / Latin-1 single-byte     | 1 byte         | ~250–275             |
+| Latin diacritics (é, ñ, …)           | 2 bytes        | ~125–135             |
+| CJK / most non-Latin scripts         | 3 bytes        | ~85–90               |
+| Emoji and other 4-byte UTF-8         | 4 bytes        | ~60–70               |
+
+**Behavior on too-long messages:** the service refuses to forward them
+and replies privately to the original sender with a message like
+`Message not delivered: 423 bytes is too long for single-packet relay.
+Your max is roughly 269 bytes (link-based delivery is not implemented
+yet).` The message is **not** appended to history, so other roster
+members never see it.
+
+**Forwarded messages add a `[nickname] ` prefix**, which is what makes
+the practical limit lower than the raw 280-byte cap and why long
+nicknames cost everyone budget.
+
+**No fragmentation / Reticulum Resource transfer.** SPEC §10 resource
+fragmentation isn't implemented; multi-packet messages would require
+link-based delivery, which isn't implemented either.
 
 ### Transport
 

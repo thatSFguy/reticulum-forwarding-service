@@ -2,6 +2,8 @@ package service
 
 import (
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/commands"
@@ -53,7 +55,29 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	}
 
 	body := "[" + senderNick + "] " + content
-	delivered := s.forwardToRoster(senderHex, body)
+
+	// Pre-check that the prefixed body will fit in a single opportunistic
+	// LXMF packet. If not, reply to the sender so they know their message
+	// wasn't relayed (rather than silently dropping it). The check here
+	// avoids iterating the whole roster just to fail identically every time.
+	if err := lxmf.CheckOpportunisticSize(nil, []byte(body), nil); err != nil {
+		if errors.Is(err, lxmf.ErrPayloadTooLarge) {
+			s.replyTooLarge(senderBytes, len(content), len(senderNick))
+			return
+		}
+		s.logger.Printf("size check: %v", err)
+		return
+	}
+
+	delivered, sizeErr := s.forwardToRoster(senderHex, body)
+	if sizeErr != nil {
+		// Defensive: pre-check passed but a per-recipient send still saw
+		// ErrPayloadTooLarge. Shouldn't happen given the body is identical,
+		// but if a future change makes Send size-sensitive per recipient,
+		// the user still gets feedback.
+		s.replyTooLarge(senderBytes, len(content), len(senderNick))
+		return
+	}
 
 	if delivered > 0 {
 		_ = s.history.Append(history.Entry{
@@ -62,5 +86,25 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 			SenderNick: senderNick,
 			Content:    content,
 		})
+	}
+}
+
+// replyTooLarge sends a short error message back to the original sender
+// telling them their message wasn't forwarded because it would exceed the
+// single-packet opportunistic LXMF limit. Includes the approximate budget
+// they have so they can trim accordingly.
+func (s *Service) replyTooLarge(senderBytes []byte, contentLen, nickLen int) {
+	prefixOverhead := nickLen + 3 // "[" + nick + "] "
+	// MaxOpportunisticPayload (295) - 16 (msgpack overhead with empty title +
+	// empty fields, bin16 content prefix to be safe) - prefixOverhead.
+	budget := lxmf.MaxOpportunisticPayload - 16 - prefixOverhead
+	if budget < 0 {
+		budget = 0
+	}
+	msg := fmt.Sprintf("Message not delivered: %d bytes is too long for single-packet relay. "+
+		"Your max is roughly %d bytes (link-based delivery is not implemented yet).",
+		contentLen, budget)
+	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
+		s.logger.Printf("too-large notify send: %v", err)
 	}
 }

@@ -24,7 +24,21 @@ const (
 	// (the recipient's dest_hash is in the outer Reticulum packet header
 	// and is omitted from the body itself).
 	minOpportunisticBodyLen = rns.IdentityHashLen + signatureLen
+
+	// MaxOpportunisticPayload is the upstream LXMF limit on the msgpack
+	// payload size for a single-packet opportunistic LXMF message,
+	// matching LXMessage.ENCRYPTED_PACKET_MAX_CONTENT in upstream Python
+	// LXMF 0.9.6. Larger messages downgrade to link-based delivery in
+	// upstream — which we don't implement yet — so we surface
+	// ErrPayloadTooLarge instead.
+	MaxOpportunisticPayload = 295
 )
+
+// ErrPayloadTooLarge is returned by SignAndPackOpportunistic / Delivery.Send
+// when the msgpack payload would exceed MaxOpportunisticPayload. Callers can
+// catch it with errors.Is to provide structured feedback (e.g. tell the
+// original sender their message was too long for single-packet relay).
+var ErrPayloadTooLarge = errors.New("LXMF opportunistic payload exceeds size limit")
 
 // AppName + AspectDelivery yield the dotted full name "lxmf.delivery"
 // (SPEC §1.2 / §4.4).
@@ -100,6 +114,10 @@ func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
+	if len(payload) > MaxOpportunisticPayload {
+		return nil, fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d (link-based delivery for larger messages is not implemented)",
+			ErrPayloadTooLarge, len(payload), MaxOpportunisticPayload)
+	}
 
 	signedData := buildSignedData(destHash, senderDestHash, payload)
 	sig := senderID.Sign(signedData)
@@ -165,6 +183,32 @@ func (m *Message) Verify(senderEd25519Pub []byte) error {
 		return nil
 	}
 	return errors.New("LXMF signature invalid (both raw and stamp-stripped variants)")
+}
+
+// CheckOpportunisticSize returns nil if a SignAndPackOpportunistic call with
+// these inputs would fit in a single Reticulum DATA packet, or an error
+// wrapping ErrPayloadTooLarge if not. It does the msgpack marshal but no
+// crypto and no network I/O — safe to call as a pre-check before iterating
+// recipients.
+func CheckOpportunisticSize(title, content []byte, fields map[any]any) error {
+	if title == nil {
+		title = []byte{}
+	}
+	if content == nil {
+		content = []byte{}
+	}
+	if fields == nil {
+		fields = map[any]any{}
+	}
+	payload, err := msgpack.Marshal([]any{0.0, title, content, fields})
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if len(payload) > MaxOpportunisticPayload {
+		return fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d",
+			ErrPayloadTooLarge, len(payload), MaxOpportunisticPayload)
+	}
+	return nil
 }
 
 func buildSignedData(destHash, sourceHash, msgpackPayload []byte) []byte {

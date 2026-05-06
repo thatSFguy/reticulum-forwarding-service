@@ -2,6 +2,7 @@ package lxmf
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -141,6 +142,59 @@ func TestRoundTripPreservesTimestamp(t *testing.T) {
 	m, _ := ParseOpportunisticBody(body, recipientDest)
 	if m.Timestamp.Before(before.Add(-time.Second)) || m.Timestamp.After(after.Add(time.Second)) {
 		t.Errorf("timestamp %v not within [%v, %v]", m.Timestamp, before, after)
+	}
+}
+
+func TestSendRejectsOversizePayload(t *testing.T) {
+	sender, _ := rns.NewIdentity()
+	recipient, _ := rns.NewIdentity()
+	senderDest := sender.DestinationHashFor(FullName())
+	recipientDest := recipient.DestinationHashFor(FullName())
+
+	// 1 KB content is well over the 295-byte msgpack payload cap.
+	huge := bytes.Repeat([]byte("x"), 1024)
+	_, err := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, huge, nil)
+	if err == nil {
+		t.Fatal("expected error for oversize payload")
+	}
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Errorf("error should wrap ErrPayloadTooLarge, got %v", err)
+	}
+}
+
+func TestCheckOpportunisticSize(t *testing.T) {
+	// Empty title + empty fields gives 16 bytes overhead with bin16 prefix
+	// (1 array + 9 ts + 2 empty title + 3 bin16 content prefix + 1 fields).
+	// MaxOpportunisticPayload = 295, so 295 - 16 = 279 bytes content
+	// (worst-case bin16) is the boundary. bin8 (content < 256) saves 1 byte
+	// of prefix, so up to 280 bytes of content can fit in that path.
+
+	if err := CheckOpportunisticSize(nil, []byte(""), nil); err != nil {
+		t.Errorf("empty content should fit: %v", err)
+	}
+
+	// 280-byte payload: msgpack uses bin16 prefix, so total payload is
+	// 1 + 9 + 2 + 3 + 280 + 1 = 296 — over by one byte. Verify rejection.
+	just_over := bytes.Repeat([]byte("x"), 280)
+	if err := CheckOpportunisticSize(nil, just_over, nil); err == nil {
+		t.Errorf("280-byte content should be rejected (uses bin16 prefix, payload = 296)")
+	}
+
+	// 255-byte payload: msgpack uses bin8 prefix (1+9+2+2+255+1 = 270),
+	// well under the limit.
+	bin8_max := bytes.Repeat([]byte("x"), 255)
+	if err := CheckOpportunisticSize(nil, bin8_max, nil); err != nil {
+		t.Errorf("255-byte content should fit (bin8): %v", err)
+	}
+
+	// 1KB: clearly too large.
+	too_big := bytes.Repeat([]byte("x"), 1024)
+	err := CheckOpportunisticSize(nil, too_big, nil)
+	if err == nil {
+		t.Fatal("1KB should be rejected")
+	}
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Errorf("error should wrap ErrPayloadTooLarge, got %v", err)
 	}
 }
 
