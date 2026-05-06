@@ -1,5 +1,24 @@
 # reticulum-forwarding-service config.
 
+# admins / mods are LXMF DESTINATION hashes (16 raw bytes / 32 hex chars,
+# specifically the lxmf.delivery destination hash of the user's identity —
+# NOT the raw identity hash).
+#
+# The simplest way to find a user's destination hash: have them message
+# the service once. The forwarder logs `new sender contact: full
+# dest_hash = ...` on first contact. Copy that into this list and
+# restart.
+#
+# admins / mods MUST be at the TOP of the file, before any [section]
+# header — TOML scopes top-level keys to whichever section is
+# currently active.
+admins = [
+  # "00112233445566778899aabbccddeeff",
+]
+mods = [
+  # "ffeeddccbbaa99887766554433221100",
+]
+
 [service]
 # Shown in our LXMF announces. Visible to all Reticulum nodes.
 display_name = "Forwarder"
@@ -52,13 +71,5 @@ timeout = "10s"
 count   = 100
 max_age = "7d"
 
-# Identity hashes are 16 raw bytes / 32 hex chars. Get yours by running
-# `fwdsvc -config /tmp/...` once and reading the "service identity hash"
-# line on stdout — the service generates an identity on first run.
-admins = [
-  # "00112233445566778899aabbccddeeff",
-]
-
-mods = [
-  # "ffeeddccbbaa99887766554433221100",
-]
+# (admins / mods are now at the top of the file — see the comment block
+# at the start. They MUST be top-level keys before any [section] header.)

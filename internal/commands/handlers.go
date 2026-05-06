@@ -27,6 +27,12 @@ func (r Role) atLeastMod() bool { return r == RoleMod || r == RoleAdmin }
 type Dispatcher struct {
 	Cfg    *config.Config
 	Roster *roster.Roster
+
+	// Announce, when set, is invoked by the /announce command to trigger
+	// an immediate fresh announce broadcast (instead of waiting for the
+	// next periodic re-announce). Mod/admin only. Returning an error
+	// surfaces it to the sender.
+	Announce func() error
 }
 
 // Dispatch returns the reply to send back to the sender. An empty string
@@ -50,6 +56,8 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return d.handleBan(role, parsed.Args)
 	case "unban":
 		return d.handleUnban(role, parsed.Args)
+	case "announce":
+		return d.handleAnnounce(role)
 	default:
 		return fmt.Sprintf("unknown command /%s — try /?", parsed.Name)
 	}
@@ -71,18 +79,23 @@ func (d *Dispatcher) role(senderHash string) Role {
 // link-based reply in our current implementation.
 // TestHelpTextFitsOpportunisticPacket guards the byte budget.
 //
-// Single-line on purpose: live testing against a mobile LXMF client
-// surfaced a UI-side quirk where multi-line bodies got truncated at a
-// line boundary in the display. Joining with " · " (middle dot) plus a
-// blank space avoids newlines while still giving visual separation
-// between commands.
-//
-// Convention notes: ASCII hyphens (em-dash is 3 bytes); "mod" stands in
-// for "mod/admin"; USER means "nickname or hex hash prefix (>=4)".
+// Conventions: ASCII hyphens (em-dash is 3 bytes); "mod" stands in for
+// "mod/admin"; USER means "nickname or hex hash prefix (>=4)".
 func helpText() string {
-	return "Commands: /? help · /users members · /mods · /admin · " +
-		"/nick NAME = rename self · /nick USER NAME = mod rename · " +
-		"/kick /ban /unban USER = mod · USER = nick or hex >=4"
+	return strings.Join([]string{
+		"Commands (mod = mod/admin):",
+		"/?, /help - this list",
+		"/users - members",
+		"/mods - mods",
+		"/admin - admins",
+		"/nick NAME - rename self",
+		"/nick USER NAME - mod",
+		"/kick USER - mod: remove",
+		"/ban USER - mod: block",
+		"/unban USER - mod: unblock",
+		"/announce - mod: re-announce now",
+		"USER = nick or hex (>=4)",
+	}, "\n")
 }
 
 func (d *Dispatcher) listUsers() string {
@@ -249,6 +262,19 @@ func (d *Dispatcher) handleUnban(role Role, args []string) string {
 	default:
 		return fmt.Sprintf("%q matches multiple banned users: %s", hash, strings.Join(shortHashes(matches), ", "))
 	}
+}
+
+func (d *Dispatcher) handleAnnounce(role Role) string {
+	if !role.atLeastMod() {
+		return "Only mods or admins can /announce."
+	}
+	if d.Announce == nil {
+		return "Announce hook not wired (server bug)."
+	}
+	if err := d.Announce(); err != nil {
+		return "Announce failed: " + err.Error()
+	}
+	return "OK, announced."
 }
 
 func titleCase(s string) string {

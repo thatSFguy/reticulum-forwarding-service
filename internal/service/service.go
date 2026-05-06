@@ -68,15 +68,19 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:        cfg,
-		identity:   id,
-		transport:  transport,
-		delivery:   delivery,
-		roster:     r,
-		history:    hist,
-		dispatcher: &commands.Dispatcher{Cfg: cfg, Roster: r},
-		logger:     logger,
-		now:        time.Now,
+		cfg:       cfg,
+		identity:  id,
+		transport: transport,
+		delivery:  delivery,
+		roster:    r,
+		history:   hist,
+		logger:    logger,
+		now:       time.Now,
+	}
+	svc.dispatcher = &commands.Dispatcher{
+		Cfg:      cfg,
+		Roster:   r,
+		Announce: svc.announceNow,
 	}
 
 	delivery.OnMessage = svc.onLXMFReceived
@@ -145,6 +149,18 @@ func (s *Service) buildAnnounce() (*rns.Packet, error) {
 		return nil, err
 	}
 	return rns.BuildAnnounce(s.identity, lxmf.FullName(), appData, nil)
+}
+
+// announceNow is the /announce hook — builds a fresh announce and
+// broadcasts it on every interface immediately. Logs the action so an
+// operator watching the log can correlate.
+func (s *Service) announceNow() error {
+	pkt, err := s.buildAnnounce()
+	if err != nil {
+		return fmt.Errorf("build: %w", err)
+	}
+	s.logger.Printf("on-demand /announce")
+	return s.transport.Broadcast(pkt)
 }
 
 func (s *Service) runPrune(now time.Time) {

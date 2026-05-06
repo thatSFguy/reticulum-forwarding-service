@@ -26,6 +26,13 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		return
 	}
 
+	// Log the full sender hash on first contact so operators can find it
+	// (e.g. to add a user to the admins/mods list) without digging into
+	// state.json. Subsequent messages from the same sender don't re-log.
+	if !s.roster.Has(senderBytes) {
+		s.logger.Printf("new sender contact: full dest_hash = %s", senderHex)
+	}
+
 	content := strings.TrimRight(string(msg.Content), "\r\n")
 
 	// Spam-prevention character limit (separate from wire-format size).
