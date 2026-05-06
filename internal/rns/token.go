@@ -154,6 +154,16 @@ func tokenDeriveKeys(sharedSecret, salt []byte) (signingKey, encryptionKey []byt
 	return signingKey, encryptionKey, nil
 }
 
+// sha256NewFromInternal exposes a fresh sha256 hasher to test code in
+// this package without pulling crypto/sha256 into test files that
+// already inherit the import via package code.
+func sha256NewFromInternal() interface {
+	Write(p []byte) (int, error)
+	Sum(b []byte) []byte
+} {
+	return sha256.New()
+}
+
 func hmacSHA256(key []byte, parts ...[]byte) []byte {
 	h := hmac.New(sha256.New, key)
 	for _, p := range parts {
