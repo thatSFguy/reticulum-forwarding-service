@@ -68,25 +68,21 @@ func (d *Dispatcher) role(senderHash string) Role {
 
 // helpText is the /? and /help reply. MUST fit in a single opportunistic
 // LXMF packet — the sender of /? has no way to receive a chunked or
-// link-based reply in our current implementation. TestHelpTextFitsOpportunisticPacket
-// in commands_test.go guards against drift.
+// link-based reply in our current implementation.
+// TestHelpTextFitsOpportunisticPacket guards the byte budget.
 //
-// Conventions used to keep it terse: ASCII hyphens (em-dash is 3 bytes),
-// "mod" abbreviates "mod/admin", USER is "nick or hex prefix (>=4)".
+// Single-line on purpose: live testing against a mobile LXMF client
+// surfaced a UI-side quirk where multi-line bodies got truncated at a
+// line boundary in the display. Joining with " · " (middle dot) plus a
+// blank space avoids newlines while still giving visual separation
+// between commands.
+//
+// Convention notes: ASCII hyphens (em-dash is 3 bytes); "mod" stands in
+// for "mod/admin"; USER means "nickname or hex hash prefix (>=4)".
 func helpText() string {
-	return strings.Join([]string{
-		"Commands (mod = mod/admin):",
-		"/?, /help - this list",
-		"/users - members",
-		"/mods - mods",
-		"/admin - admins",
-		"/nick NAME - rename self",
-		"/nick USER NAME - mod",
-		"/kick USER - mod: remove",
-		"/ban USER - mod: block",
-		"/unban USER - mod: unblock",
-		"USER = nick or hex (>=4)",
-	}, "\n")
+	return "Commands: /? help · /users members · /mods · /admin · " +
+		"/nick NAME = rename self · /nick USER NAME = mod rename · " +
+		"/kick /ban /unban USER = mod · USER = nick or hex >=4"
 }
 
 func (d *Dispatcher) listUsers() string {
