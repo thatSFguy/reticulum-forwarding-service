@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/commands"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/history"
@@ -26,6 +27,15 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	}
 
 	content := strings.TrimRight(string(msg.Content), "\r\n")
+
+	// Spam-prevention character limit (separate from wire-format size).
+	// Commands aren't subject to it (they're short and bounded).
+	if !commands.IsCommand(content) && s.cfg.Service.MaxInboundChars > 0 {
+		if charCount := utf8.RuneCountInString(content); charCount > s.cfg.Service.MaxInboundChars {
+			s.replyOverInboundLimit(senderBytes, charCount)
+			return
+		}
+	}
 
 	if commands.IsCommand(content) {
 		parsed := commands.Parse(content)
@@ -90,9 +100,13 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 }
 
 // replyTooLarge sends a short error message back to the original sender
-// telling them their message wasn't forwarded because it would exceed the
-// single-packet opportunistic LXMF limit. Includes the approximate budget
-// they have so they can trim accordingly.
+// telling them their message wasn't forwarded because, after the
+// "[nick] " prefix was added, the forwarded packet wouldn't fit in a
+// single-packet opportunistic LXMF body. Includes the approximate
+// content budget they have so they can trim accordingly.
+//
+// Distinct from replyOverInboundLimit, which fires earlier on the
+// configured spam-prevention character cap.
 func (s *Service) replyTooLarge(senderBytes []byte, contentLen, nickLen int) {
 	prefixOverhead := nickLen + 3 // "[" + nick + "] "
 	// MaxOpportunisticPayload (295) - 16 (msgpack overhead with empty title +
@@ -101,10 +115,23 @@ func (s *Service) replyTooLarge(senderBytes []byte, contentLen, nickLen int) {
 	if budget < 0 {
 		budget = 0
 	}
-	msg := fmt.Sprintf("Message not delivered: %d bytes is too long for single-packet relay. "+
-		"Your max is roughly %d bytes (link-based delivery is not implemented yet).",
-		contentLen, budget)
+	msg := fmt.Sprintf("Message not forwarded: with the [nick] prefix it exceeds the single-packet relay limit. "+
+		"Try shortening to about %d bytes of content.", budget)
 	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
 		s.logger.Printf("too-large notify send: %v", err)
+	}
+}
+
+// replyOverInboundLimit notifies a sender that their message exceeded
+// the configured per-message character cap (service.max_inbound_chars).
+// The message is dropped — not forwarded, not added to history, and
+// the sender is not joined to the roster on the strength of an
+// oversized first message.
+func (s *Service) replyOverInboundLimit(senderBytes []byte, charCount int) {
+	limit := s.cfg.Service.MaxInboundChars
+	msg := fmt.Sprintf("Message rejected: limit is %d characters per message, yours was %d. Please shorten and resend.",
+		limit, charCount)
+	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
+		s.logger.Printf("inbound-limit notify send: %v", err)
 	}
 }

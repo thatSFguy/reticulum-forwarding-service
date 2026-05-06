@@ -31,6 +31,15 @@ type ServiceConfig struct {
 	PruneAfter       Duration `toml:"prune_after"`
 	PruneInterval    Duration `toml:"prune_interval"`
 	AnnounceInterval Duration `toml:"announce_interval"`
+
+	// MaxInboundChars caps how many UTF-8 characters an inbound message
+	// from a roster member may contain. Anything longer is rejected with
+	// a polite reply to the sender — the message is not forwarded, not
+	// added to history, and the sender is not joined to the roster on
+	// the back of an oversized first message. This is a spam-prevention
+	// policy limit, separate from the wire-format size cap.
+	// 0 = unlimited (not recommended). Default: 500.
+	MaxInboundChars int `toml:"max_inbound_chars"`
 }
 
 // InterfaceConfig declares a single Reticulum I/O interface. Currently
@@ -102,6 +111,7 @@ func defaults() *Config {
 			PruneAfter:       Duration(4 * 7 * 24 * time.Hour),
 			PruneInterval:    Duration(1 * time.Hour),
 			AnnounceInterval: Duration(10 * time.Minute),
+			MaxInboundChars:  500,
 		},
 		Replay: ReplayConfig{
 			Count:  100,
@@ -134,6 +144,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.AnnounceInterval.Std() <= 0 {
 		return fmt.Errorf("service.announce_interval must be positive")
+	}
+	if c.Service.MaxInboundChars < 0 {
+		return fmt.Errorf("service.max_inbound_chars must be >= 0")
 	}
 	for i, iface := range c.Interfaces {
 		if iface.Type != "tcp_client" {

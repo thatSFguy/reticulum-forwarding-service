@@ -21,6 +21,13 @@ prune_interval = "1h"
 # can learn / refresh our path. Upstream Python rnsd uses 5-15 minutes.
 announce_interval = "10m"
 
+# Maximum number of UTF-8 characters allowed in an inbound message from
+# a roster member. Messages longer than this are rejected with a polite
+# reply to the sender; the message is not forwarded and not added to
+# history. Spam-prevention policy limit, separate from the lower wire-
+# format size cap (~280 bytes). Set to 0 to disable.
+max_inbound_chars = 500
+
 # Reticulum I/O interfaces. Currently only "tcp_client" is supported, which
 # dials a TCPServerInterface peer (e.g. a public testnet entry node) and
 # exchanges HDLC-framed packets in both directions. You can list multiple.
