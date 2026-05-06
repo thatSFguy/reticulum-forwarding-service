@@ -81,6 +81,7 @@ func New(cfg *config.Config) (*Service, error) {
 		Cfg:      cfg,
 		Roster:   r,
 		Announce: svc.announceNow,
+		OnJoin:   svc.onJoin,
 	}
 
 	delivery.OnMessage = svc.onLXMFReceived
@@ -149,6 +150,18 @@ func (s *Service) buildAnnounce() (*rns.Packet, error) {
 		return nil, err
 	}
 	return rns.BuildAnnounce(s.identity, lxmf.FullName(), appData, nil)
+}
+
+// onJoin is the /join post-action hook — fires replay-on-join for the
+// newly-joined user so they catch up on recent history.
+func (s *Service) onJoin(senderHex string) {
+	bytes, err := hex.DecodeString(senderHex)
+	if err != nil || len(bytes) != 16 {
+		return
+	}
+	if s.cfg.Replay.Count > 0 {
+		go s.replayHistoryTo(bytes, s.now())
+	}
 }
 
 // announceNow is the /announce hook — builds a fresh announce and

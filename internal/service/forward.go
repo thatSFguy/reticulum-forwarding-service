@@ -7,15 +7,15 @@ import (
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
 )
 
-// forwardToRoster fans the body out to every roster member except the
-// sender. Each Send drops silently with a log entry if the recipient
-// hasn't announced yet (we can't encrypt to an unknown public key).
-// Returns the count of recipients we successfully queued sends for, plus
-// the first lxmf.ErrPayloadTooLarge encountered (since that error is the
-// same for every recipient — the body is identical — surfacing it lets
-// the caller reply to the original sender once).
+// forwardToRoster fans the body out to every ACTIVE (non-paused) roster
+// member except the sender. Each Send drops silently with a log entry
+// if the recipient hasn't announced yet (we can't encrypt to an unknown
+// public key). Returns the count of recipients we successfully queued
+// sends for, plus the first lxmf.ErrPayloadTooLarge encountered (the
+// error is the same for every recipient — the body is identical — so
+// surfacing it lets the caller reply to the original sender once).
 func (s *Service) forwardToRoster(senderHex, body string) (int, error) {
-	hashes := s.roster.Hashes()
+	hashes := s.roster.ActiveHashes()
 	delivered := 0
 	var sizeErr error
 	for _, h := range hashes {

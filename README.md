@@ -49,29 +49,44 @@ client.
 
 ## Behaviour
 
-- **Join by sending a message.** The first non-command message from a new
-  Reticulum identity adds them to the roster.
+- **Explicit `/join`.** The first non-command message from a new
+  Reticulum identity gets a private invitation reply explaining the
+  service. The sender's message is not forwarded and they are not added
+  to the roster — they have to send `/join` to opt in. This avoids the
+  awkward "I sent one message and now strangers are getting it" UX.
 - **Replay on join.** New (and returning) members receive the most recent
   messages so they can pick up the conversation. Defaults: last 100 messages,
   nothing older than 7 days.
+- **Pause without leaving.** A member can `/pause` to stop receiving
+  forwarded messages (and stop having their own messages forwarded to
+  others). `/resume` reverses it. Roster entry stays put.
+- **Per-message char cap** (`service.max_inbound_chars`, default 500) —
+  oversized non-command messages get rejected with a polite reply,
+  separate from the lower wire-format size limit.
 - **Auto-prune.** Members whose Reticulum identity hasn't announced in
   4 weeks are removed.
-- **Slash commands** for moderation:
+- **Slash commands** (the `/?` reply is **role-aware** — non-members
+  only see commands that work for them, mods see the moderation set):
 
   | Command                   | Who          | Effect                                                            |
   |---------------------------|--------------|-------------------------------------------------------------------|
-  | `/?` or `/help`           | anyone       | List commands                                                     |
-  | `/users`                  | anyone       | List roster                                                       |
+  | `/?` or `/help`           | anyone       | List commands available to you                                    |
+  | `/users`                  | anyone       | List roster (paused members marked `[paused]`)                    |
   | `/mods`                   | anyone       | List mods                                                         |
   | `/admin`                  | anyone       | List admins                                                       |
-  | `/nick <newname>`         | anyone       | Change own nickname                                               |
+  | `/join`                   | non-members  | Opt in: receive forwarded messages, your messages get forwarded   |
+  | `/leave`                  | members      | Leave the chat (you can `/join` again later)                      |
+  | `/pause`                  | members      | Stop receiving forwarded messages (and stop forwarding yours)     |
+  | `/resume`                 | members      | Reverse `/pause`                                                  |
+  | `/nick <newname>`         | members      | Change own nickname                                               |
   | `/nick <user> <newname>`  | mods, admins | Change another user's nickname                                    |
-  | `/kick <user>`            | mods, admins | Remove from roster (user can rejoin by sending another message)   |
-  | `/ban <user>`             | mods, admins | Add to banlist; future messages dropped                           |
+  | `/kick <user>`            | mods, admins | Remove from roster (user can `/join` again)                       |
+  | `/ban <user>`             | mods, admins | Add to banlist; future `/join`s and messages refused              |
   | `/unban <user>`           | mods, admins | Remove from banlist                                               |
+  | `/announce`               | mods, admins | Broadcast a fresh announce immediately                            |
 
-  `<user>` accepts a nickname (case-insensitive) or an identity-hash prefix
-  (>=4 hex chars).
+  `<user>` accepts a nickname (case-insensitive) or a destination-hash
+  prefix (>=4 hex chars).
 
 ## Limitations
 

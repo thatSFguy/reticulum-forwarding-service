@@ -35,15 +35,9 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 
 	content := strings.TrimRight(string(msg.Content), "\r\n")
 
-	// Spam-prevention character limit (separate from wire-format size).
-	// Commands aren't subject to it (they're short and bounded).
-	if !commands.IsCommand(content) && s.cfg.Service.MaxInboundChars > 0 {
-		if charCount := utf8.RuneCountInString(content); charCount > s.cfg.Service.MaxInboundChars {
-			s.replyOverInboundLimit(senderBytes, charCount)
-			return
-		}
-	}
-
+	// Commands route to the dispatcher regardless of membership state —
+	// the dispatcher's helpers (like /join, /?) need to handle non-
+	// members. The dispatcher returns role/membership-aware replies.
 	if commands.IsCommand(content) {
 		parsed := commands.Parse(content)
 		reply := s.dispatcher.Dispatch(senderHex, parsed)
@@ -55,14 +49,32 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		return
 	}
 
-	isNewOrReturning, err := s.roster.AddOrUpdate(senderBytes, now)
-	if err != nil {
-		s.logger.Printf("roster update: %v", err)
+	// Non-command path. Apply the per-message char cap first.
+	if s.cfg.Service.MaxInboundChars > 0 {
+		if charCount := utf8.RuneCountInString(content); charCount > s.cfg.Service.MaxInboundChars {
+			s.replyOverInboundLimit(senderBytes, charCount)
+			return
+		}
+	}
+
+	// Non-members get an invitation, NOT auto-joined. They have to
+	// explicitly send /join to participate.
+	if !s.roster.Has(senderBytes) {
+		s.replyInvite(senderBytes)
 		return
 	}
 
-	if isNewOrReturning && s.cfg.Replay.Count > 0 {
-		go s.replayHistoryTo(senderBytes, now)
+	// Paused members get a notice; their message isn't forwarded and
+	// isn't appended to history.
+	if s.roster.IsPaused(senderHex) {
+		s.replyPaused(senderBytes)
+		return
+	}
+
+	// Refresh last_message_at so prune doesn't sweep an active member.
+	if _, err := s.roster.AddOrUpdate(senderBytes, now); err != nil {
+		s.logger.Printf("roster update: %v", err)
+		return
 	}
 
 	senderUser, _ := s.roster.Get(senderHex)
@@ -126,6 +138,24 @@ func (s *Service) replyTooLarge(senderBytes []byte, contentLen, nickLen int) {
 		"Try shortening to about %d bytes of content.", budget)
 	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
 		s.logger.Printf("too-large notify send: %v", err)
+	}
+}
+
+// replyInvite tells a non-member how to join. Sent on every non-command
+// message from a non-member; the message itself isn't forwarded.
+func (s *Service) replyInvite(senderBytes []byte) {
+	const msg = "Welcome. To join this chat send /join. Send /? for help. Until you join, your messages aren't forwarded."
+	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
+		s.logger.Printf("invite send: %v", err)
+	}
+}
+
+// replyPaused tells a paused member that their non-command message
+// wasn't forwarded.
+func (s *Service) replyPaused(senderBytes []byte) {
+	const msg = "You're paused. Your message wasn't forwarded. Send /resume to come back."
+	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
+		s.logger.Printf("paused notify send: %v", err)
 	}
 }
 

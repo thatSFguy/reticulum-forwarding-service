@@ -10,11 +10,16 @@ import (
 )
 
 type User struct {
-	Hash            string    `json:"-"`                  // hex, populated on load
-	Nickname        string    `json:"nickname"`
-	JoinedAt        time.Time `json:"joined_at"`
-	LastAnnounceAt  time.Time `json:"last_announce_at,omitempty"`
-	LastMessageAt   time.Time `json:"last_message_at,omitempty"`
+	Hash           string    `json:"-"` // hex, populated on load
+	Nickname       string    `json:"nickname"`
+	JoinedAt       time.Time `json:"joined_at"`
+	LastAnnounceAt time.Time `json:"last_announce_at,omitempty"`
+	LastMessageAt  time.Time `json:"last_message_at,omitempty"`
+
+	// Paused: when true, the forwarder skips this user when fanning out
+	// messages, and rejects their non-command messages with a "you're
+	// paused" reply rather than forwarding. Toggled via /pause /resume.
+	Paused bool `json:"paused,omitempty"`
 }
 
 func (u User) LastSeen() time.Time {
@@ -144,6 +149,42 @@ func (r *Roster) Get(hashHex string) (User, bool) {
 		return User{}, false
 	}
 	return *u, true
+}
+
+// SetPaused toggles the user's paused flag. Returns an error if the user
+// isn't in the roster.
+func (r *Roster) SetPaused(hashHex string, paused bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[strings.ToLower(hashHex)]
+	if !ok {
+		return fmt.Errorf("user not in roster")
+	}
+	u.Paused = paused
+	return r.persistLocked()
+}
+
+// IsPaused returns true iff the user is in the roster and currently paused.
+func (r *Roster) IsPaused(hashHex string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[strings.ToLower(hashHex)]
+	return ok && u.Paused
+}
+
+// ActiveHashes returns the hex hashes of all roster members whose Paused
+// flag is false. The forwarder uses this to decide who receives a fanned-
+// out message.
+func (r *Roster) ActiveHashes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.users))
+	for h, u := range r.users {
+		if !u.Paused {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 func (r *Roster) SetNickname(hashHex, nick string) error {

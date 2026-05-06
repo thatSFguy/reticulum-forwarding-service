@@ -72,40 +72,202 @@ func mustBytes(t *testing.T, s string) []byte {
 	return b
 }
 
-// TestHelpTextFitsOpportunisticPacket guards against the /? help text
-// growing past the single-packet opportunistic LXMF limit (upstream
-// LXMessage.ENCRYPTED_PACKET_MAX_CONTENT = 295). On 2026-05-06 a live
-// test against a mobile client failed silently because the help text
-// was 605 bytes after msgpack framing — the protocol worked, but the
-// reply got refused locally and the user saw nothing.
-//
-// We mirror the wire format (timestamp + empty title + content + empty
-// fields) without going through the lxmf package, which would create a
-// circular import.
-func TestHelpTextFitsOpportunisticPacket(t *testing.T) {
-	const maxOpportunisticPayload = 295 // upstream LXMessage.ENCRYPTED_PACKET_MAX_CONTENT
+// helpTextMsgpackPayload mirrors the wire format SignAndPackOpportunistic
+// produces — float64 timestamp + empty title + content + empty fixmap —
+// so the test can assert size without taking a circular import on lxmf.
+func helpTextMsgpackPayload(t *testing.T, c *Caller) []byte {
+	t.Helper()
 	payload, err := msgpack.Marshal([]any{
-		0.0,                  // float64 timestamp placeholder
-		[]byte{},             // empty title (msgpack bin)
-		[]byte(helpText()),   // content
-		map[any]any{},        // empty fields fixmap
+		0.0,
+		[]byte{},
+		[]byte(helpText(c)),
+		map[any]any{},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(payload) > maxOpportunisticPayload {
-		t.Errorf("helpText() msgpack payload = %d bytes, must be <= %d (single-packet opportunistic LXMF limit). Trim helpText() — replies do not chunk in our current implementation.",
-			len(payload), maxOpportunisticPayload)
+	return payload
+}
+
+// TestHelpTextFitsOpportunisticPacket guards against ANY caller state
+// producing a help text that exceeds the single-packet opportunistic
+// LXMF cap (upstream LXMessage.ENCRYPTED_PACKET_MAX_CONTENT = 295). All
+// four states need to fit because /? is dispatched without knowing in
+// advance which the caller is.
+func TestHelpTextFitsOpportunisticPacket(t *testing.T) {
+	const maxOpportunisticPayload = 295
+	cases := []struct {
+		name string
+		c    *Caller
+	}{
+		{"non-member, regular user", &Caller{Member: false, Role: RoleUser}},
+		{"member, regular user", &Caller{Member: true, Role: RoleUser}},
+		{"non-member, mod", &Caller{Member: false, Role: RoleMod}},
+		{"member, admin", &Caller{Member: true, Role: RoleAdmin}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := helpTextMsgpackPayload(t, tc.c)
+			if len(payload) > maxOpportunisticPayload {
+				t.Errorf("helpText for %s = %d bytes msgpack, must be <= %d (single-packet cap)\n--- text:\n%s",
+					tc.name, len(payload), maxOpportunisticPayload, helpText(tc.c))
+			}
+		})
 	}
 }
 
-func TestHelpListsAllCommands(t *testing.T) {
+func TestHelpForNonMemberShowsJoinNotLeave(t *testing.T) {
 	d := newDispatcher(t)
 	out := d.Dispatch(userHash, Parse("/?"))
-	for _, want := range []string{"/users", "/mods", "/admin", "/nick", "/kick", "/ban", "/unban"} {
+	for _, want := range []string{"/?", "/users", "/join"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("help missing %q\n%s", want, out)
+			t.Errorf("non-member help missing %q\n%s", want, out)
 		}
+	}
+	for _, missing := range []string{"/leave", "/pause", "/resume", "/kick", "/ban"} {
+		if strings.Contains(out, missing) {
+			t.Errorf("non-member help should not show %q\n%s", missing, out)
+		}
+	}
+}
+
+func TestHelpForMemberShowsLeavePauseNotKickBan(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	out := d.Dispatch(userHash, Parse("/?"))
+	for _, want := range []string{"/leave", "/pause", "/resume", "/nick"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("member help missing %q\n%s", want, out)
+		}
+	}
+	for _, missing := range []string{"/join", "/kick", "/ban", "/unban", "/announce"} {
+		if strings.Contains(out, missing) {
+			t.Errorf("member help should not show %q\n%s", missing, out)
+		}
+	}
+}
+
+func TestHelpForModShowsAllCommands(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, modHash), time.Now())
+	out := d.Dispatch(modHash, Parse("/?"))
+	for _, want := range []string{"/users", "/mods", "/admin", "/nick", "/kick", "/ban", "/unban", "/announce", "/leave", "/pause", "/resume"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mod help missing %q\n%s", want, out)
+		}
+	}
+}
+
+func TestJoinAddsToRosterAndCallsOnJoin(t *testing.T) {
+	d := newDispatcher(t)
+	var joined string
+	d.OnJoin = func(h string) { joined = h }
+
+	out := d.Dispatch(userHash, Parse("/join"))
+	if !strings.Contains(strings.ToLower(out), "joined") {
+		t.Errorf("expected join confirmation, got %q", out)
+	}
+	if !d.Roster.Has(mustBytes(t, userHash)) {
+		t.Error("user should be in roster after /join")
+	}
+	if joined != userHash {
+		t.Errorf("OnJoin called with %q, want %q", joined, userHash)
+	}
+}
+
+func TestJoinIdempotent(t *testing.T) {
+	d := newDispatcher(t)
+	_ = d.Dispatch(userHash, Parse("/join"))
+	out := d.Dispatch(userHash, Parse("/join"))
+	if !strings.Contains(strings.ToLower(out), "already") {
+		t.Errorf("second /join should be idempotent, got %q", out)
+	}
+}
+
+func TestJoinRejectsBanned(t *testing.T) {
+	d := newDispatcher(t)
+	_ = d.Roster.Ban(userHash)
+	out := d.Dispatch(userHash, Parse("/join"))
+	if !strings.Contains(strings.ToLower(out), "banned") {
+		t.Errorf("/join should refuse banned user, got %q", out)
+	}
+	if d.Roster.Has(mustBytes(t, userHash)) {
+		t.Error("/join shouldn't have added a banned user to the roster")
+	}
+}
+
+func TestLeaveRemovesFromRoster(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	out := d.Dispatch(userHash, Parse("/leave"))
+	if !strings.Contains(strings.ToLower(out), "left") {
+		t.Errorf("expected leave ack, got %q", out)
+	}
+	if d.Roster.Has(mustBytes(t, userHash)) {
+		t.Error("user should be gone from roster after /leave")
+	}
+}
+
+func TestLeaveByNonMember(t *testing.T) {
+	d := newDispatcher(t)
+	out := d.Dispatch(userHash, Parse("/leave"))
+	if !strings.Contains(strings.ToLower(out), "not in the chat") {
+		t.Errorf("expected non-member denial, got %q", out)
+	}
+}
+
+func TestPauseSetsFlag(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+
+	out := d.Dispatch(userHash, Parse("/pause"))
+	if !strings.Contains(strings.ToLower(out), "paused") {
+		t.Errorf("expected pause ack, got %q", out)
+	}
+	if !d.Roster.IsPaused(userHash) {
+		t.Error("user should be marked paused")
+	}
+}
+
+func TestPauseTwiceIsIdempotent(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+
+	_ = d.Dispatch(userHash, Parse("/pause"))
+	out := d.Dispatch(userHash, Parse("/pause"))
+	if !strings.Contains(strings.ToLower(out), "already paused") {
+		t.Errorf("expected already-paused ack, got %q", out)
+	}
+}
+
+func TestPauseRequiresMembership(t *testing.T) {
+	d := newDispatcher(t)
+	out := d.Dispatch(userHash, Parse("/pause"))
+	if !strings.Contains(strings.ToLower(out), "not in the chat") {
+		t.Errorf("expected non-member denial, got %q", out)
+	}
+}
+
+func TestResumeClearsFlag(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	_ = d.Roster.SetPaused(userHash, true)
+
+	out := d.Dispatch(userHash, Parse("/resume"))
+	if !strings.Contains(strings.ToLower(out), "resumed") {
+		t.Errorf("expected resume ack, got %q", out)
+	}
+	if d.Roster.IsPaused(userHash) {
+		t.Error("user should no longer be paused")
+	}
+}
+
+func TestResumeWithoutPause(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	out := d.Dispatch(userHash, Parse("/resume"))
+	if !strings.Contains(strings.ToLower(out), "not paused") {
+		t.Errorf("expected not-paused message, got %q", out)
 	}
 }
 
@@ -166,6 +328,14 @@ func TestNickSelfChange(t *testing.T) {
 	}
 }
 
+func TestNickSelfRequiresMembership(t *testing.T) {
+	d := newDispatcher(t)
+	out := d.Dispatch(userHash, Parse("/nick alice"))
+	if !strings.Contains(strings.ToLower(out), "join first") {
+		t.Errorf("expected join-first message for non-member /nick, got %q", out)
+	}
+}
+
 func TestNickOthersRequiresMod(t *testing.T) {
 	d := newDispatcher(t)
 	now := time.Now()
@@ -219,6 +389,18 @@ func TestListUsers(t *testing.T) {
 	}
 }
 
+func TestListUsersMarksPaused(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	_ = d.Roster.SetNickname(userHash, "alice")
+	_ = d.Roster.SetPaused(userHash, true)
+
+	out := d.Dispatch(userHash, Parse("/users"))
+	if !strings.Contains(out, "[paused]") {
+		t.Errorf("expected paused users to be marked, got %q", out)
+	}
+}
+
 func TestListAdminsAndMods(t *testing.T) {
 	d := newDispatcher(t)
 	out := d.Dispatch(userHash, Parse("/admin"))
@@ -228,5 +410,29 @@ func TestListAdminsAndMods(t *testing.T) {
 	out = d.Dispatch(userHash, Parse("/mods"))
 	if !strings.Contains(out, modHash[:8]) {
 		t.Errorf("expected mod hash in /mods, got %q", out)
+	}
+}
+
+func TestAnnounceRequiresMod(t *testing.T) {
+	d := newDispatcher(t)
+	out := d.Dispatch(userHash, Parse("/announce"))
+	if !strings.Contains(strings.ToLower(out), "only mods or admins") {
+		t.Errorf("expected permission denial, got %q", out)
+	}
+}
+
+func TestAnnounceCallsHook(t *testing.T) {
+	d := newDispatcher(t)
+	called := false
+	d.Announce = func() error {
+		called = true
+		return nil
+	}
+	out := d.Dispatch(modHash, Parse("/announce"))
+	if !strings.Contains(strings.ToLower(out), "announced") {
+		t.Errorf("expected success ack, got %q", out)
+	}
+	if !called {
+		t.Error("Announce hook was not called")
 	}
 }
