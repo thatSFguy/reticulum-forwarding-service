@@ -26,7 +26,10 @@ announce_interval = "10m"
 # exchanges HDLC-framed packets in both directions. You can list multiple.
 [[interfaces]]
 type = "tcp_client"
-addr = "amsterdam.connect.reticulum.network:4965"
+# rns.michmesh.net is one community-run testnet entry node — replace with
+# whatever Reticulum peer you'd like to connect through (a local rnsd, a
+# different community node, etc).
+addr = "rns.michmesh.net:7822"
 # Optional dial timeout; 0 = stdlib default (~30s).
 timeout = "10s"
 

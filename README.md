@@ -4,12 +4,48 @@ A Reticulum/LXMF group-chat relay written in pure Go, with no third-party
 Reticulum library — implements the protocol layers we need directly from
 [the spec](https://github.com/thatSFguy/reticulum-specifications) and
 verifies wire-format correctness against the upstream Python `rns` + `LXMF`
-reference implementation.
+reference implementation. Live-tested round-trip with a mobile LXMF client
+over a public testnet entry node.
 
 Users send LXMF messages to this service and it forwards each message to
 every other roster member, creating a many-to-many group chat. Designed to
 run unattended on small Linux hardware: Debian, Raspberry Pi (arm64/armv7),
 x86_64.
+
+## Wire-format features implemented
+
+These are the parts of the Reticulum / LXMF protocol stack the service
+currently speaks. Everything here has at least one of: a static test
+vector against canonical Python output, a passing live subprocess
+interop test, or a confirmed live round-trip with a third-party LXMF
+client.
+
+- **Identity** — X25519 + Ed25519 keypair, on-disk format, `identity_hash`
+  and `destination_hash` derivation (SPEC §1).
+- **Token cipher** — AES-256-CBC + HMAC-SHA256 + HKDF with `identity_hash`
+  salt (SPEC §3).
+- **Packet header** — HEADER_1 and HEADER_2 codec, including the
+  hashable-part rule that makes proofs survive HEADER_1↔HEADER_2 in flight
+  (SPEC §2).
+- **HDLC framing** for `tcp_client` interfaces (SPEC §8.2).
+- **Announce** — build, parse, verify, with and without ratchet
+  (SPEC §4). `app_data` msgpack `[display_name_bytes, stamp_cost]`
+  including the §9.3 `bin`-vs-`str` gotcha.
+- **Opportunistic LXMF** — full sign/encrypt/decrypt/verify both
+  directions, including the SPEC §5.6 dual-msgpack-variant tolerance
+  for stamp-bearing inbound messages (SPEC §5).
+- **PROOF emission** — every received `CTX_NONE` DATA packet at a
+  SINGLE destination is acknowledged with a 64-byte implicit-form
+  PROOF (SPEC §6.5), so senders' `PacketReceipt`s resolve and they
+  stop retransmitting.
+- **Path requests** — when a message arrives from a sender we can't
+  verify, we issue a `path?` broadcast (SPEC §7.1) and a path-aware
+  relay's path-response announce gives us their public key. Per-target
+  60 s dedup so noisy retransmitters don't make us flood.
+- **HEADER_2 originator conversion** — outbound DATA addressed to a
+  recipient that announced via a relay uses HEADER_2 with the cached
+  next-hop transport_id (SPEC §2.3), so multi-hop recipients actually
+  receive our messages.
 
 ## Behaviour
 
@@ -95,6 +131,11 @@ link-based delivery, which isn't implemented either.
   Reticulum nodes can't route through us.
 - **No automatic reconnect.** If the TCP interface drops, the service
   logs and continues; you have to restart it. (Use systemd `Restart=on-failure`.)
+- **Path table doesn't persist across restart.** `transport.known` is
+  in-memory only. After a restart, the next message from a previously-known
+  sender triggers a path? request (SPEC §7.1) and the first message from
+  them gets dropped while we wait for the path response. The roster
+  itself, history, and banlist do persist on disk.
 
 ### LXMF features deferred
 
@@ -146,6 +187,13 @@ link-based delivery, which isn't implemented either.
   roster. No private message paths.
 - **No edit / delete.** Forwarded messages are immutable; a sender cannot
   retract or amend.
+- **No reply pagination.** Command replies are sent as a single LXMF
+  packet (~280-byte budget). `/?` and `/help` fit by design (a regression
+  test guards the budget). `/users`, `/mods`, `/admin` produce dynamic
+  output that can in principle exceed the limit if the roster grows large;
+  the send-side `ErrPayloadTooLarge` guard refuses the reply and logs the
+  failure rather than corrupting the wire. Pagination (`/users 1`,
+  `/users 2`, etc.) is a future enhancement.
 
 ## Build
 
@@ -181,9 +229,9 @@ Or use `scripts/build-rpi.sh`.
 1. Copy `configs/fwdsvc.example.toml` to `~/.fwdsvc/config.toml` and edit:
    - Set `display_name` to whatever you want users to see in announces.
    - Set at least one `[[interfaces]]` entry with `type = "tcp_client"`
-     pointing at a reachable Reticulum peer (e.g.
-     `amsterdam.connect.reticulum.network:4965` for the public testnet, or
-     a local `rnsd` if you're running one).
+     pointing at a reachable Reticulum peer (e.g. `rns.michmesh.net:7822`
+     is one community-run testnet entry node, or use a local `rnsd` if
+     you're running one).
    - Add the identity hash of at least one admin to `admins = [...]`.
      (You can run the service once first, copy the printed identity hash,
      then add it.)
@@ -214,7 +262,7 @@ Default state directory is `~/.fwdsvc/`:
 
 ## Verification
 
-The implementation is checked at two levels:
+The implementation is checked at three increasingly strong levels:
 
 - **Static byte-level test vectors** — `go test ./...` includes tests
   that load the canonical Python `rns` 1.2.0 / `LXMF` 0.9.6 wire-byte
@@ -229,6 +277,15 @@ The implementation is checked at two levels:
   and exchanges fresh announce + opportunistic-LXMF bytes with the Go
   code in **both directions**. Requires `pip install rns lxmf` (rns
   >= 1.2.0, LXMF >= 0.9.6) and `python` on PATH. Skips otherwise.
+
+- **Live mesh interop with a third-party LXMF client.** During
+  development the service was run against `rns.michmesh.net:7822` and
+  exercised end-to-end with a mobile LXMF client: announce propagation
+  in both directions, opportunistic LXMF send, PROOF emission stopping
+  the mobile's retransmit loop, path-request resolving an unannounced
+  sender, and `/?` round-tripping back to the mobile UI. This is the
+  qualitative check that nothing in our wire format silently breaks
+  when the path involves real relays and asymmetric mesh topology.
 
 ## License
 
