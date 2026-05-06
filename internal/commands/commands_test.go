@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vmihailenco/msgpack/v5"
+
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/roster"
 )
@@ -68,6 +70,33 @@ func mustBytes(t *testing.T, s string) []byte {
 		t.Fatalf("bad hex: %s", s)
 	}
 	return b
+}
+
+// TestHelpTextFitsOpportunisticPacket guards against the /? help text
+// growing past the single-packet opportunistic LXMF limit (upstream
+// LXMessage.ENCRYPTED_PACKET_MAX_CONTENT = 295). On 2026-05-06 a live
+// test against a mobile client failed silently because the help text
+// was 605 bytes after msgpack framing — the protocol worked, but the
+// reply got refused locally and the user saw nothing.
+//
+// We mirror the wire format (timestamp + empty title + content + empty
+// fields) without going through the lxmf package, which would create a
+// circular import.
+func TestHelpTextFitsOpportunisticPacket(t *testing.T) {
+	const maxOpportunisticPayload = 295 // upstream LXMessage.ENCRYPTED_PACKET_MAX_CONTENT
+	payload, err := msgpack.Marshal([]any{
+		0.0,                  // float64 timestamp placeholder
+		[]byte{},             // empty title (msgpack bin)
+		[]byte(helpText()),   // content
+		map[any]any{},        // empty fields fixmap
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) > maxOpportunisticPayload {
+		t.Errorf("helpText() msgpack payload = %d bytes, must be <= %d (single-packet opportunistic LXMF limit). Trim helpText() — replies do not chunk in our current implementation.",
+			len(payload), maxOpportunisticPayload)
+	}
 }
 
 func TestHelpListsAllCommands(t *testing.T) {

@@ -66,19 +66,26 @@ func (d *Dispatcher) role(senderHash string) Role {
 	}
 }
 
+// helpText is the /? and /help reply. MUST fit in a single opportunistic
+// LXMF packet — the sender of /? has no way to receive a chunked or
+// link-based reply in our current implementation. TestHelpTextFitsOpportunisticPacket
+// in commands_test.go guards against drift.
+//
+// Conventions used to keep it terse: ASCII hyphens (em-dash is 3 bytes),
+// "mod" abbreviates "mod/admin", USER is "nick or hex prefix (>=4)".
 func helpText() string {
 	return strings.Join([]string{
-		"Commands:",
-		"  /? or /help                 — this message",
-		"  /users                      — list members",
-		"  /mods                       — list mods",
-		"  /admin                      — list admins",
-		"  /nick <newname>             — change your nickname",
-		"  /nick <user> <newname>      — (mods/admins) change another user's nickname",
-		"  /kick <user>                — (mods/admins) remove user; they can rejoin",
-		"  /ban <user>                 — (mods/admins) ban; future messages dropped",
-		"  /unban <user>               — (mods/admins) lift a ban",
-		"<user> = nickname or hex hash prefix (>=4 chars)",
+		"Commands (mod = mod/admin):",
+		"/?, /help - this list",
+		"/users - members",
+		"/mods - mods",
+		"/admin - admins",
+		"/nick NAME - rename self",
+		"/nick USER NAME - mod",
+		"/kick USER - mod: remove",
+		"/ban USER - mod: block",
+		"/unban USER - mod: unblock",
+		"USER = nick or hex (>=4)",
 	}, "\n")
 }
 
