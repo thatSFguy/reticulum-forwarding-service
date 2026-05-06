@@ -6,3 +6,15 @@
 *.out
 .idea/
 .vscode/
+
+# Agent / AI config files — kept locally for the developer working on the
+# repo, not pushed to the public repo.
+AGENTS.md
+AGENT.md
+agents.md
+agent.md
+.claude/
+.cursor/
+.copilot/
+.aider*
+CLAUDE.md
