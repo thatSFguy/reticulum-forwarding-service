@@ -192,6 +192,97 @@ func TestTransportBroadcastFansOut(t *testing.T) {
 	}
 }
 
+func TestTransportEmitsProofForInboundData(t *testing.T) {
+	id, _ := NewIdentity()
+	destHash := id.DestinationHashFor(FullName("lxmf", "delivery"))
+
+	iface := newFakeInterface()
+	tr := NewTransport(nil)
+	tr.AddInterface(iface)
+	tr.RegisterLocal(&LocalDestination{
+		DestHash: destHash,
+		Identity: id,
+		OnPacket: func(*Packet) {},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tr.Run(ctx)
+
+	// Inject a fake DATA packet addressed to our local destination.
+	dataPkt := &Packet{
+		HeaderType:      HeaderType1,
+		DestinationType: DestinationSingle,
+		PacketType:      PacketData,
+		DestHash:        destHash,
+		Context:         ContextNone,
+		Data:            []byte("ciphertext"),
+	}
+	dataWire, _ := dataPkt.Pack()
+	iface.inbox <- dataWire
+
+	// Expect to see a PROOF emitted on the same interface.
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		for _, sent := range iface.sentCopy() {
+			parsed, err := ParsePacket(sent)
+			if err != nil {
+				continue
+			}
+			if parsed.PacketType == PacketProof {
+				if parsed.Context != ContextNone {
+					t.Errorf("proof context = 0x%02x, want 0x00", parsed.Context)
+				}
+				if len(parsed.Data) != ProofBodyImplicitLen {
+					t.Errorf("proof body length = %d, want %d", len(parsed.Data), ProofBodyImplicitLen)
+				}
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("no PROOF emitted (sent %d packets)", len(iface.sentCopy()))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func TestTransportSkipsProofWhenIdentityAbsent(t *testing.T) {
+	destHash := newDummyHash(0xDD)
+
+	iface := newFakeInterface()
+	tr := NewTransport(nil)
+	tr.AddInterface(iface)
+	tr.RegisterLocal(&LocalDestination{
+		DestHash: destHash,
+		// Identity intentionally nil — used by tests that don't care about proofs.
+		OnPacket: func(*Packet) {},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tr.Run(ctx)
+
+	dataPkt := &Packet{
+		HeaderType:      HeaderType1,
+		DestinationType: DestinationSingle,
+		PacketType:      PacketData,
+		DestHash:        destHash,
+		Context:         ContextNone,
+		Data:            []byte("c"),
+	}
+	dataWire, _ := dataPkt.Pack()
+	iface.inbox <- dataWire
+
+	time.Sleep(80 * time.Millisecond)
+	for _, sent := range iface.sentCopy() {
+		p, err := ParsePacket(sent)
+		if err == nil && p.PacketType == PacketProof {
+			t.Error("transport emitted a proof when LocalDestination.Identity was nil")
+		}
+	}
+}
+
 func TestTransportCapturesTransportIDFromHeader2Announce(t *testing.T) {
 	id, _ := NewIdentity()
 	pkt, _ := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)

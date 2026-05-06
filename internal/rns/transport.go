@@ -82,8 +82,14 @@ func (k *KnownIdentity) Ed25519Public() []byte { return k.PublicKey[32:] }
 // destination). Inbound DATA packets matching DestHash are handed to OnPacket.
 // OnPacket is called from the transport's dispatcher goroutine; if the
 // callback is slow it should hand the packet off to its own goroutine.
+//
+// If Identity is non-nil, the transport emits a PROOF packet (SPEC §6.5)
+// acknowledging every received CTX_NONE DATA packet so the sender's
+// PacketReceipt can resolve and retransmits stop. This is non-optional for
+// interop with upstream Reticulum clients.
 type LocalDestination struct {
 	DestHash []byte
+	Identity *Identity
 	OnPacket func(p *Packet)
 }
 
@@ -235,7 +241,9 @@ func (t *Transport) dispatch(raw []byte) {
 	case PacketData:
 		t.handleData(p)
 	default:
-		// LinkRequest, Proof — out of scope.
+		// LinkRequest, Proof — out of scope as inbound (we don't track
+		// outstanding PacketReceipts, so we have nothing to validate
+		// inbound proofs against).
 	}
 }
 
@@ -296,6 +304,19 @@ func (t *Transport) handleData(p *Packet) {
 		// Not for us; in a transit relay we'd forward — out of scope here.
 		return
 	}
+
+	// SPEC §6.5: emit a PROOF packet ACK-ing the inbound DATA before any
+	// application-layer processing, so the sender's PacketReceipt can
+	// resolve quickly even if our handler is slow. Skipped if the local
+	// destination didn't supply an identity (e.g. some unit-test setups).
+	if dest.Identity != nil && p.Context == ContextNone && p.DestinationType == DestinationSingle {
+		if proof, err := ProveOpportunistic(dest.Identity, p); err != nil {
+			t.logger.Printf("prove: %v", err)
+		} else if err := t.Broadcast(proof); err != nil {
+			t.logger.Printf("proof broadcast: %v", err)
+		}
+	}
+
 	dest.OnPacket(p)
 }
 

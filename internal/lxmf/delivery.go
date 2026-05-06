@@ -44,6 +44,7 @@ func NewDelivery(transport *rns.Transport, identity *rns.Identity) (*Delivery, e
 	}
 	if err := transport.RegisterLocal(&rns.LocalDestination{
 		DestHash: d.destHash,
+		Identity: d.identity, // enables SPEC §6.5 PROOF emission on inbound DATA
 		OnPacket: d.handleInbound,
 	}); err != nil {
 		return nil, err
