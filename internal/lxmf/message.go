@@ -72,6 +72,13 @@ type Message struct {
 // — SPEC §5.4). title may be nil. content may be nil but typically isn't.
 // fields may be nil (encoded as an empty msgpack map).
 func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) ([]byte, error) {
+	return signAndPackOpportunisticAt(senderID, senderDestHash, destHash, title, content, fields, time.Now())
+}
+
+// signAndPackOpportunisticAt is the testable form: timestamp is injected
+// rather than read from the wall clock, so deterministic test vectors
+// (which pin the timestamp) can be reproduced exactly.
+func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) ([]byte, error) {
 	if senderID == nil {
 		return nil, errors.New("nil sender identity")
 	}
@@ -88,7 +95,7 @@ func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash [
 		fields = map[any]any{}
 	}
 
-	tsSeconds := float64(time.Now().UnixMicro()) / 1_000_000.0
+	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
 	payload, err := msgpack.Marshal([]any{tsSeconds, title, content, fields})
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
