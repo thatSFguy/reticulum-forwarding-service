@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -31,8 +32,15 @@ type Transport struct {
 	locals           map[string]*LocalDestination
 	announceHandlers []AnnounceHandler
 
+	pathRequestsSent map[string]time.Time // key: hex dest_hash, dedup window
+
 	logger Logger
 }
+
+// PathRequestDedupWindow caps how often we re-issue a path? request for the
+// same target. SPEC §7.2.2 has a much larger 32k-tag table at the relay
+// side; we just want to avoid spamming when an unknown sender retransmits.
+const PathRequestDedupWindow = 60 * time.Second
 
 // Interface is anything that can ship Reticulum packets in both directions.
 // TCPClient satisfies it; future LoRa or AutoInterface implementations
@@ -108,10 +116,43 @@ func NewTransport(logger Logger) *Transport {
 		logger = noopLogger{}
 	}
 	return &Transport{
-		known:  map[string]*KnownIdentity{},
-		locals: map[string]*LocalDestination{},
-		logger: logger,
+		known:            map[string]*KnownIdentity{},
+		locals:           map[string]*LocalDestination{},
+		pathRequestsSent: map[string]time.Time{},
+		logger:           logger,
 	}
+}
+
+// RequestPath broadcasts an SPEC §7.1 path? request for the given target
+// destination hash. Used when we receive a message from a sender whose
+// announce we don't have — path-aware relays respond with a path-response
+// announce carrying the sender's public key.
+//
+// Deduplicates per-target within PathRequestDedupWindow (60 s) so a noisy
+// retransmitter doesn't make us flood the network.
+//
+// Returns nil silently when a request was suppressed by dedup; the caller
+// should treat this method as fire-and-forget.
+func (t *Transport) RequestPath(targetDestHash []byte) error {
+	if len(targetDestHash) != IdentityHashLen {
+		return fmt.Errorf("target dest_hash must be %d bytes", IdentityHashLen)
+	}
+	key := hex.EncodeToString(targetDestHash)
+
+	t.mu.Lock()
+	if last, ok := t.pathRequestsSent[key]; ok && time.Since(last) < PathRequestDedupWindow {
+		t.mu.Unlock()
+		return nil
+	}
+	t.pathRequestsSent[key] = time.Now()
+	t.mu.Unlock()
+
+	pkt, err := BuildPathRequest(targetDestHash)
+	if err != nil {
+		return err
+	}
+	t.logger.Printf("path? request for %s", key[:8])
+	return t.Broadcast(pkt)
 }
 
 // AddInterface plugs an Interface into the dispatcher. Must be called
@@ -289,6 +330,7 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	handlers := append([]AnnounceHandler(nil), t.announceHandlers...)
 	t.mu.Unlock()
 
+	t.logger.Printf("announce verified: dest=%x name=%x hops=%d ctxFlag=%v", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag)
 	for _, h := range handlers {
 		if h.AspectMatch(a.NameHash) {
 			h.OnAnnounce(a)

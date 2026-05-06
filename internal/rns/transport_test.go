@@ -192,6 +192,56 @@ func TestTransportBroadcastFansOut(t *testing.T) {
 	}
 }
 
+func TestRequestPathBroadcastsAndDedups(t *testing.T) {
+	iface := newFakeInterface()
+	tr := NewTransport(nil)
+	tr.AddInterface(iface)
+
+	target := newDummyHash(0x55)
+
+	if err := tr.RequestPath(target); err != nil {
+		t.Fatal(err)
+	}
+	// Second + third calls within the dedup window must not re-broadcast.
+	if err := tr.RequestPath(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.RequestPath(target); err != nil {
+		t.Fatal(err)
+	}
+
+	sent := iface.sentCopy()
+	if len(sent) != 1 {
+		t.Fatalf("expected exactly 1 path request broadcast (deduped), got %d", len(sent))
+	}
+
+	pkt, err := ParsePacket(sent[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.PacketType != PacketData || pkt.DestinationType != DestinationPlain {
+		t.Errorf("not a path-request shaped packet: type=%d destType=%d", pkt.PacketType, pkt.DestinationType)
+	}
+	if !bytes.Equal(pkt.Data[:IdentityHashLen], target) {
+		t.Errorf("payload target mismatch")
+	}
+}
+
+func TestRequestPathDedupesPerTarget(t *testing.T) {
+	// Distinct targets should NOT dedup — each gets its own request.
+	iface := newFakeInterface()
+	tr := NewTransport(nil)
+	tr.AddInterface(iface)
+
+	_ = tr.RequestPath(newDummyHash(0x01))
+	_ = tr.RequestPath(newDummyHash(0x02))
+	_ = tr.RequestPath(newDummyHash(0x03))
+
+	if got := len(iface.sentCopy()); got != 3 {
+		t.Errorf("expected 3 path requests for 3 distinct targets, got %d", got)
+	}
+}
+
 func TestTransportEmitsProofForInboundData(t *testing.T) {
 	id, _ := NewIdentity()
 	destHash := id.DestinationHashFor(FullName("lxmf", "delivery"))

@@ -146,6 +146,13 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 	sender := d.transport.Recall(msg.SourceHash)
 	if sender == nil {
 		d.errorf("sender %x unknown — must announce first", msg.SourceHash[:4])
+		// Ask the network for their announce. Future messages from this
+		// sender will succeed once a path-response announce arrives and
+		// populates Transport.known. The current message stays dropped —
+		// PROOF was already emitted so the mobile client won't retry it.
+		if err := d.transport.RequestPath(msg.SourceHash); err != nil {
+			d.errorf("path? request: %w", err)
+		}
 		return
 	}
 	if err := msg.Verify(sender.Ed25519Public()); err != nil {
