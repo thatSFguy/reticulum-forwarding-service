@@ -387,7 +387,8 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	handlers := append([]AnnounceHandler(nil), t.announceHandlers...)
 	t.mu.Unlock()
 
-	t.logger.Printf("announce verified: dest=%x name=%x hops=%d ctxFlag=%v", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag)
+	displayName, _ := DecodeLXMFAppDataDisplayName(a.AppData)
+	t.logger.Printf("announce verified: dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
 	for _, h := range handlers {
 		if h.AspectMatch(a.NameHash) {
 			h.OnAnnounce(a)
@@ -516,16 +517,29 @@ func (t *Transport) handleLinkData(p *Packet) {
 	// Emit the explicit-form link DATA proof BEFORE returning so the
 	// sender's PacketReceipt can resolve quickly. (SPEC §6.5.6 — without
 	// this the sender retransmits and eventually tears the link down.)
+	// Per upstream RNS/Link.py:279 the responder signs with its
+	// destination identity's long-term Ed25519 priv (NOT a link-derived
+	// shared key — the initiator can't reproduce HKDF output, so a shared
+	// key would never validate on their side).
 	link.mu.Lock()
-	signing := link.Signing
+	signer := link.responderIdentity
 	linkID := link.ID
 	link.mu.Unlock()
-	if signing != nil {
-		if proof, err := BuildLinkProof(linkID, signing, p); err != nil {
-			t.logger.Printf("build link proof: %v", err)
-		} else if err := t.Broadcast(proof); err != nil {
-			t.logger.Printf("broadcast link proof: %v", err)
-		}
+	if signer == nil {
+		// Only happens if we're the initiator side of this link (we don't
+		// currently send link DATA proofs as initiator) or if the link was
+		// constructed without an identity (test paths). Logged so an
+		// operator can see ack failures distinct from network problems.
+		t.logger.Printf("link PROOF skipped: no responder identity for link=%x", linkID[:4])
+		return
+	}
+	proof, err := BuildLinkProof(linkID, signer.Sign, p)
+	if err != nil {
+		t.logger.Printf("build link proof: %v", err)
+		return
+	}
+	if err := t.Broadcast(proof); err != nil {
+		t.logger.Printf("broadcast link proof: %v", err)
 	}
 }
 

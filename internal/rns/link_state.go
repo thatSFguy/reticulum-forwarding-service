@@ -69,6 +69,15 @@ type Link struct {
 	// generated to derive session keys. Cleared once Active.
 	myResponderEphPriv []byte
 
+	// responderIdentity is the local destination identity that signs
+	// outbound link DATA proofs when we are the responder (per upstream
+	// RNS/Link.py:279, `self.sig_prv = self.owner.identity.sig_prv` on
+	// the responder side). Nil when we are the initiator. The initiator
+	// peer can verify our proof signatures because it cached our
+	// long-term Ed25519 pubkey when it looked us up to send the
+	// LINKREQUEST.
+	responderIdentity *Identity
+
 	CreatedAt    time.Time
 	LastActivity time.Time
 
@@ -264,6 +273,7 @@ func (lm *LinkManager) AcceptIncomingLinkRequest(reqPkt *Packet, localID *Identi
 		Signing:            signing,
 		Encryption:         encryption,
 		myResponderEphPriv: respEphPriv, // kept around in case we want to renegotiate
+		responderIdentity:  localID,     // signs link DATA proofs (SPEC §6.5.6)
 		CreatedAt:          time.Now(),
 		LastActivity:       time.Now(),
 	}

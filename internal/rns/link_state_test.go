@@ -80,7 +80,9 @@ func TestLinkDataRoundTrip(t *testing.T) {
 }
 
 func TestLinkProofRoundTripExplicitForm(t *testing.T) {
-	signing := bytes.Repeat([]byte{0x33}, 32) // Ed25519 seed
+	// Build/validate now use asymmetric Ed25519 (sign with priv, verify
+	// with pub) per SPEC §6.5.6 / RNS Link.py:279, NOT a shared HKDF seed.
+	signer, _ := NewIdentity()
 	linkID := bytes.Repeat([]byte{0x77}, IdentityHashLen)
 
 	// Build a fake DATA packet to prove against.
@@ -93,7 +95,7 @@ func TestLinkProofRoundTripExplicitForm(t *testing.T) {
 		Data:            []byte("ciphertext"),
 	}
 
-	proofPkt, err := BuildLinkProof(linkID, signing, original)
+	proofPkt, err := BuildLinkProof(linkID, signer.Sign, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +112,8 @@ func TestLinkProofRoundTripExplicitForm(t *testing.T) {
 		t.Errorf("body length = %d, want %d (always explicit on links)", len(proofPkt.Data), ProofBodyExplicitLen)
 	}
 
-	gotHash, err := ValidateLinkProof(proofPkt, signing)
+	signerPub := signer.PublicKey()[32:] // Ed25519 half
+	gotHash, err := ValidateLinkProof(proofPkt, signerPub)
 	if err != nil {
 		t.Fatalf("ValidateLinkProof: %v", err)
 	}
@@ -126,7 +129,8 @@ func TestValidateLinkProofRejectsImplicit(t *testing.T) {
 	// A 64-byte body would be the implicit form. SPEC §6.5.6 says link
 	// DATA proofs are ALWAYS the explicit (96-byte) form on RNS 1.2.0;
 	// our validator must reject 64-byte bodies.
-	signing := bytes.Repeat([]byte{0x33}, 32)
+	signer, _ := NewIdentity()
+	pub := signer.PublicKey()[32:]
 	implicitProof := &Packet{
 		HeaderType:      HeaderType1,
 		DestinationType: DestinationLink,
@@ -135,14 +139,14 @@ func TestValidateLinkProofRejectsImplicit(t *testing.T) {
 		Context:         ContextNone,
 		Data:            bytes.Repeat([]byte{0x00}, ProofBodyImplicitLen),
 	}
-	if _, err := ValidateLinkProof(implicitProof, signing); err == nil {
+	if _, err := ValidateLinkProof(implicitProof, pub); err == nil {
 		t.Error("validator accepted implicit-form body on a link DATA proof — must reject per SPEC §6.5.6")
 	}
 }
 
 func TestValidateLinkProofRejectsBadSignature(t *testing.T) {
-	signing := bytes.Repeat([]byte{0x33}, 32)
-	wrongSigning := bytes.Repeat([]byte{0x44}, 32)
+	signer, _ := NewIdentity()
+	wrongSigner, _ := NewIdentity()
 	linkID := bytes.Repeat([]byte{0x77}, IdentityHashLen)
 	original := &Packet{
 		HeaderType:      HeaderType1,
@@ -153,9 +157,10 @@ func TestValidateLinkProofRejectsBadSignature(t *testing.T) {
 		Data:            []byte("ciphertext"),
 	}
 
-	proofPkt, _ := BuildLinkProof(linkID, signing, original)
-	if _, err := ValidateLinkProof(proofPkt, wrongSigning); err == nil {
-		t.Error("validator accepted proof signed with different signing key")
+	proofPkt, _ := BuildLinkProof(linkID, signer.Sign, original)
+	wrongPub := wrongSigner.PublicKey()[32:]
+	if _, err := ValidateLinkProof(proofPkt, wrongPub); err == nil {
+		t.Error("validator accepted proof signed with a different identity")
 	}
 }
 

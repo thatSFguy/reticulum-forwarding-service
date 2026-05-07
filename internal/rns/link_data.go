@@ -66,16 +66,24 @@ func ParseLinkDataPacket(p *Packet, signing, encryption []byte) ([]byte, error) 
 // Per upstream RNS 1.2.0 link DATA proofs are ALWAYS explicit
 // regardless of the global use_implicit_proof setting.
 //
-// The signature is over SHA-256(original.HashablePart()), signed with
-// the link-derived signing_key (used as an Ed25519 seed). Both sides
-// have the same signing_key from the HKDF, so either side can sign and
-// either can verify proofs on this link.
-func BuildLinkProof(linkID, signingSeed []byte, original *Packet) (*Packet, error) {
+// The signature is over SHA-256(original.HashablePart()), signed by the
+// LOCAL endpoint's Ed25519 key — NOT a link-derived shared key. Per
+// upstream RNS/Link.py:279 the responder uses its destination identity's
+// long-term sig_prv; the initiator uses an ephemeral sig_prv generated
+// at link-creation time and advertised in the LINKREQUEST. Either way
+// the local side knows the priv; the remote side has the corresponding
+// pub from the handshake (responder pub from LRPROOF body, initiator
+// pub from LINKREQUEST body) and uses it to verify.
+//
+// `sign` is the local sign function — pass id.Sign as a method value
+// when signing as the responder (id is the destination identity), or a
+// closure over the ephemeral priv when signing as the initiator.
+func BuildLinkProof(linkID []byte, sign func([]byte) []byte, original *Packet) (*Packet, error) {
 	if len(linkID) != IdentityHashLen {
 		return nil, fmt.Errorf("link_id must be %d bytes", IdentityHashLen)
 	}
-	if len(signingSeed) != ed25519.SeedSize {
-		return nil, fmt.Errorf("signing seed must be %d bytes (Ed25519 seed)", ed25519.SeedSize)
+	if sign == nil {
+		return nil, errors.New("sign function is nil")
 	}
 	if original == nil {
 		return nil, errors.New("nil original packet")
@@ -86,8 +94,10 @@ func BuildLinkProof(linkID, signingSeed []byte, original *Packet) (*Packet, erro
 		return nil, fmt.Errorf("hashable part: %w", err)
 	}
 	digest := sha256.Sum256(hashable)
-	priv := ed25519.NewKeyFromSeed(signingSeed)
-	sig := ed25519.Sign(priv, digest[:])
+	sig := sign(digest[:])
+	if len(sig) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("sign returned %d bytes, want %d (Ed25519 signature size)", len(sig), ed25519.SignatureSize)
+	}
 
 	// Explicit form body: packet_hash || signature
 	body := make([]byte, 0, ProofBodyExplicitLen)
@@ -108,10 +118,10 @@ func BuildLinkProof(linkID, signingSeed []byte, original *Packet) (*Packet, erro
 }
 
 // ValidateLinkProof verifies an inbound explicit-form link DATA proof
-// against the signing seed (which both sides share). Returns the
-// 32-byte packet_hash on success — callers can use it to match against
-// outstanding PacketReceipts.
-func ValidateLinkProof(p *Packet, signingSeed []byte) ([]byte, error) {
+// against the remote endpoint's Ed25519 pubkey (responder pub for
+// initiator-side validation, initiator pub for responder-side
+// validation). Returns the 32-byte packet_hash on success.
+func ValidateLinkProof(p *Packet, peerEd25519Pub []byte) ([]byte, error) {
 	if p == nil {
 		return nil, errors.New("nil packet")
 	}
@@ -127,14 +137,13 @@ func ValidateLinkProof(p *Packet, signingSeed []byte) ([]byte, error) {
 	if len(p.Data) != ProofBodyExplicitLen {
 		return nil, fmt.Errorf("link proof must be explicit form (%d bytes), got %d", ProofBodyExplicitLen, len(p.Data))
 	}
-	if len(signingSeed) != ed25519.SeedSize {
-		return nil, fmt.Errorf("signing seed must be %d bytes", ed25519.SeedSize)
+	if len(peerEd25519Pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("peer pubkey must be %d bytes, got %d", ed25519.PublicKeySize, len(peerEd25519Pub))
 	}
 
 	packetHash := p.Data[:32]
 	sig := p.Data[32:]
-	pub := ed25519.NewKeyFromSeed(signingSeed).Public().(ed25519.PublicKey)
-	if !ed25519.Verify(pub, packetHash, sig) {
+	if !ed25519.Verify(ed25519.PublicKey(peerEd25519Pub), packetHash, sig) {
 		return nil, errors.New("link proof signature invalid")
 	}
 	return append([]byte(nil), packetHash...), nil
