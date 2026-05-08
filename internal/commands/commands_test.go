@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -367,7 +368,13 @@ func TestNickSelfRequiresMembership(t *testing.T) {
 	}
 }
 
-func TestNickOthersRequiresMod(t *testing.T) {
+// TestNickRejectsSpacesForRegularUser confirms that a non-mod typing
+// `/nick FIRST LAST` gets a clear "no spaces" error rather than the old
+// misleading "only mods or admins can change someone else's nickname"
+// reply (the parser splits on whitespace, so the call landed in the
+// 2-arg mod-only branch). Reported by an operator: users couldn't tell
+// why their multi-word nick wasn't accepted.
+func TestNickRejectsSpacesForRegularUser(t *testing.T) {
 	d := newDispatcher(t)
 	now := time.Now()
 	other := "dddddddddddddddddddddddddddddddd"
@@ -376,12 +383,40 @@ func TestNickOthersRequiresMod(t *testing.T) {
 	_ = d.Roster.SetNickname(other, "bob")
 
 	out := d.Dispatch(userHash, Parse("/nick bob carol"))
-	if !strings.Contains(strings.ToLower(out), "only mods or admins") {
-		t.Errorf("expected denial, got %q", out)
+	if !strings.Contains(strings.ToLower(out), "spaces") {
+		t.Errorf("expected no-spaces guidance, got %q", out)
+	}
+	if strings.Contains(strings.ToLower(out), "only mods or admins") {
+		t.Errorf("should not show the old mod-only error to regular users, got %q", out)
 	}
 	u, _ := d.Roster.Get(other)
 	if u.Nickname != "bob" {
 		t.Errorf("nickname should not have changed, got %q", u.Nickname)
+	}
+
+	// Three-word attempt should also yield the spaces guidance.
+	out = d.Dispatch(userHash, Parse("/nick first middle last"))
+	if !strings.Contains(strings.ToLower(out), "spaces") {
+		t.Errorf("expected no-spaces guidance for 3-word /nick, got %q", out)
+	}
+}
+
+// TestNickOthersByMod still works correctly when called by a mod.
+func TestNickOthersByMod(t *testing.T) {
+	d := newDispatcher(t)
+	now := time.Now()
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, modHash), now)
+	other := "dddddddddddddddddddddddddddddddd"
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, other), now)
+	_ = d.Roster.SetNickname(other, "bob")
+
+	out := d.Dispatch(modHash, Parse("/nick bob carol"))
+	if !strings.Contains(strings.ToLower(out), "carol") {
+		t.Errorf("mod should be able to rename other; got %q", out)
+	}
+	u, _ := d.Roster.Get(other)
+	if u.Nickname != "carol" {
+		t.Errorf("expected nickname=carol, got %q", u.Nickname)
 	}
 }
 
@@ -408,6 +443,24 @@ func TestUnknownCommand(t *testing.T) {
 	}
 }
 
+// TestUnknownCommandScrubsControlBytes ensures that a sender who puts an
+// ESC/CSI sequence in their command name doesn't get those bytes echoed
+// back into the reply (which would let them inject ANSI escapes into
+// their own terminal — minor — and into the operator log line that
+// records the reply, which is what we actually care about).
+func TestUnknownCommandScrubsControlBytes(t *testing.T) {
+	d := newDispatcher(t)
+	out := d.Dispatch(userHash, Parse("/\x1b[31mevil\x1b[0m"))
+	for _, c := range []byte(out) {
+		if c == 0x1B {
+			t.Errorf("ESC byte leaked into reply: %q", out)
+		}
+	}
+	if !strings.Contains(out, "?") {
+		t.Errorf("expected control bytes replaced with '?', got %q", out)
+	}
+}
+
 func TestListUsers(t *testing.T) {
 	d := newDispatcher(t)
 	now := time.Now()
@@ -417,6 +470,108 @@ func TestListUsers(t *testing.T) {
 	out := d.Dispatch(userHash, Parse("/users"))
 	if !strings.Contains(out, "alice") {
 		t.Errorf("expected alice in list, got %q", out)
+	}
+}
+
+// TestListUsersTruncatesWhenOverBudget reproduces the bug where /users
+// stopped working in production: with enough roster members, the reply
+// payload exceeded lxmf.MaxOpportunisticPayload (295 bytes) and Send
+// returned ErrPayloadTooLarge silently. Now the dispatcher truncates
+// the visible reply to fit the budget and logs the full list to the
+// operator log via OverflowLog.
+func TestListUsersTruncatesWhenOverBudget(t *testing.T) {
+	d := newDispatcher(t)
+	d.MaxReplyContentBytes = 200 // forces truncation with the names below
+	var overflow string
+	d.OverflowLog = func(format string, args ...any) {
+		overflow = fmt.Sprintf(format, args...)
+	}
+
+	for i := 0; i < 30; i++ {
+		hash := strings.Repeat(string(rune('a'+byte(i%6))), 32)
+		// avoid hash collisions across the loop by varying char
+		hash = fmt.Sprintf("%02x%s", i, hash[:30])
+		_, _ = d.Roster.AddOrUpdate(mustBytes(t, hash), time.Now())
+		_ = d.Roster.SetNickname(hash, fmt.Sprintf("user%02d", i))
+	}
+
+	out := d.Dispatch(userHash, Parse("/users"))
+	if len(out) > d.MaxReplyContentBytes {
+		t.Errorf("truncated /users reply is %d bytes, must be <= %d\n%s",
+			len(out), d.MaxReplyContentBytes, out)
+	}
+	if !strings.Contains(out, "...and") || !strings.Contains(out, "more") {
+		t.Errorf("expected truncation footer, got %q", out)
+	}
+	if overflow == "" {
+		t.Errorf("expected OverflowLog to be invoked")
+	}
+	if !strings.Contains(overflow, "/users reply truncated") {
+		t.Errorf("OverflowLog should mention /users reply truncated, got %q", overflow)
+	}
+}
+
+// TestListUsersUnlimitedByDefault confirms that with the dispatcher in
+// its default config (MaxReplyContentBytes == 0), a roster of any size
+// produces a complete /users reply with no truncation footer. This is
+// the post-v1.1.0 behavior: the wire-size cap was lifted because
+// Delivery.Send auto-routes oversize replies through a Reticulum Link.
+//
+// Production wiring in service.New leaves MaxReplyContentBytes at 0
+// for exactly this reason — the truncation helper is still available
+// for callers that want a per-command cap, but /users in production
+// returns the full list.
+func TestListUsersUnlimitedByDefault(t *testing.T) {
+	d := newDispatcher(t)
+	// Don't set MaxReplyContentBytes — leave at zero-value 0.
+	overflowCalled := false
+	d.OverflowLog = func(format string, args ...any) { overflowCalled = true }
+
+	for i := 0; i < 100; i++ {
+		hash := fmt.Sprintf("%02x%s", i, strings.Repeat("a", 30))
+		_, _ = d.Roster.AddOrUpdate(mustBytes(t, hash), time.Now())
+		_ = d.Roster.SetNickname(hash, fmt.Sprintf("user%03d", i))
+	}
+
+	out := d.Dispatch(userHash, Parse("/users"))
+	if strings.Contains(out, "...and") {
+		t.Errorf("expected no truncation footer with default config, got %q", out)
+	}
+	if overflowCalled {
+		t.Errorf("OverflowLog should not fire when MaxReplyContentBytes is 0")
+	}
+	// Sanity: the reply must contain the LAST user we added (would be
+	// missing if a phantom truncation snuck in).
+	if !strings.Contains(out, "user099") {
+		t.Errorf("expected last roster entry user099 in /users reply (length=%d)", len(out))
+	}
+	// And every roster entry should be present.
+	for i := 0; i < 100; i++ {
+		want := fmt.Sprintf("user%03d", i)
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %s from /users reply", want)
+			break
+		}
+	}
+}
+
+// TestListUsersFitsWithinBudget confirms that when the roster is small
+// enough, no truncation footer appears and OverflowLog is not invoked.
+func TestListUsersFitsWithinBudget(t *testing.T) {
+	d := newDispatcher(t)
+	d.MaxReplyContentBytes = 280
+	overflowCalled := false
+	d.OverflowLog = func(format string, args ...any) { overflowCalled = true }
+
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	_ = d.Roster.SetNickname(userHash, "alice")
+
+	out := d.Dispatch(userHash, Parse("/users"))
+	if strings.Contains(out, "...and") {
+		t.Errorf("did not expect truncation footer for small roster, got %q", out)
+	}
+	if overflowCalled {
+		t.Errorf("OverflowLog should not have been invoked")
 	}
 }
 

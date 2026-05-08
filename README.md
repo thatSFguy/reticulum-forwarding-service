@@ -157,6 +157,10 @@ display_name = "Forwarder"
 identity_path = "~/.fwdsvc/identity"
 state_path    = "~/.fwdsvc/state.json"
 history_path  = "~/.fwdsvc/history.json"
+# Optional: append the daemon's stdout log to a file too. Useful for
+# troubleshooting (records every inbound command, every reply, and any
+# truncation events). Empty/unset = stdout only.
+log_path      = "~/.fwdsvc/fwdsvc.log"
 
 # Drop a member from the roster if we haven't heard an announce or
 # message from them in this long. Defaults to 4 weeks.
@@ -288,12 +292,21 @@ with a third-party LXMF client.
 The implementation is intentionally minimal — just enough Reticulum +
 LXMF to run a leaf-node group-chat hub. Notable gaps:
 
-- **Forwarder still sends opportunistic** — though we receive over Link
-  fine, our outbound forward path uses opportunistic single-packet
-  delivery. So messages we forward to roster members are subject to
-  the ~280-byte cap (with `[nick] ` prefix overhead). Long replies
-  (e.g. `/users` against a roster of hundreds) can hit this and be
-  refused.
+- **Forwarder routes opportunistic + Link automatically.** Short
+  messages (≤ ~280 bytes content) ship in a single Token-encrypted
+  Reticulum DATA packet (opportunistic, fire-and-forget). Longer
+  messages fall through to a per-recipient Reticulum Link send: we
+  open the link lazily, send the LXMF body in direct form, and block
+  for the responder's link DATA proof. Idle links auto-close after
+  15 minutes; KEEPALIVE packets fire every 4 minutes to keep busy
+  links alive on the responder side. Multi-hop responders are reached
+  via HEADER_2 LINKREQUEST + transport_id from their announce. Long
+  list replies (e.g. `/users` against a large roster) return the full
+  list — they ride the same opportunistic-or-Link routing as forwarded
+  messages, so size is no longer a constraint. The truncation helper
+  still exists for callers that want a per-command cap (set
+  `Dispatcher.MaxReplyContentBytes`); production wiring leaves it at
+  0 = unlimited.
 - **Single TCP interface type** — `tcp_client` only. No LoRa /
   RNode-serial, no UDP, no AutoInterface (LAN multicast), no I2P. A
   Pi with a real LoRa modem will need to run upstream `rnsd`

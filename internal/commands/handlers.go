@@ -49,6 +49,20 @@ type Dispatcher struct {
 	// layer can fire replay-on-join for them. Called with the joiner's
 	// hex hash; safe to call from the dispatcher goroutine.
 	OnJoin func(senderHash string)
+
+	// MaxReplyContentBytes caps the byte length of a single command reply
+	// so that, after msgpack wrapping in an opportunistic LXMF packet, it
+	// still fits in the upstream single-packet limit (295 bytes msgpack —
+	// see lxmf.MaxOpportunisticPayload). List replies (/users, /mods,
+	// /admin, ambiguous-unban) are line-truncated with a "...and N more"
+	// footer when over budget. 0 disables truncation (used by tests).
+	MaxReplyContentBytes int
+
+	// OverflowLog, when non-nil, is invoked with the full untruncated
+	// reply text whenever a list reply would overflow MaxReplyContentBytes.
+	// Lets the operator see the full list in the troubleshooting log even
+	// though the user receives a truncated version.
+	OverflowLog func(format string, args ...any)
 }
 
 // Dispatch handles a single command and returns the reply text. An empty
@@ -84,7 +98,13 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 	case "announce":
 		return d.handleAnnounce(caller.Role)
 	default:
-		return fmt.Sprintf("unknown command /%s — try /?", parsed.Name)
+		// Echo the unknown command name back to the sender, but strip
+		// non-printable bytes from it first. parsed.Name comes from
+		// strings.Fields(content)[0] and is lowercased, but it can still
+		// contain ESC, BEL, CSI, DEL, etc. — a sender could otherwise
+		// inject ANSI sequences into their own reply, and any operator
+		// reading the daemon log would also see them. Defense in depth.
+		return fmt.Sprintf("unknown command /%s — try /?", scrubControlBytes(parsed.Name))
 	}
 }
 
@@ -148,8 +168,8 @@ func (d *Dispatcher) listUsers() string {
 	if len(users) == 0 {
 		return "No users."
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "Users (%d):\n", len(users))
+	header := fmt.Sprintf("Users (%d):", len(users))
+	lines := make([]string, 0, len(users))
 	for _, u := range users {
 		nick := u.Nickname
 		if nick == "" {
@@ -159,9 +179,9 @@ func (d *Dispatcher) listUsers() string {
 		if u.Paused {
 			mark = " [paused]"
 		}
-		fmt.Fprintf(&b, "  %s — %s%s\n", nick, u.Hash[:8], mark)
+		lines = append(lines, fmt.Sprintf("  %s — %s%s", nick, u.Hash[:8], mark))
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return d.fitList("/users", header, lines)
 }
 
 func (d *Dispatcher) listConfigList(label string, hashes []string) string {
@@ -170,20 +190,77 @@ func (d *Dispatcher) listConfigList(label string, hashes []string) string {
 	}
 	sorted := append([]string(nil), hashes...)
 	sort.Strings(sorted)
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s (%d):\n", titleCase(label), len(sorted))
+	header := fmt.Sprintf("%s (%d):", titleCase(label), len(sorted))
+	lines := make([]string, 0, len(sorted))
 	for _, h := range sorted {
 		nick := ""
 		if u, ok := d.Roster.Get(h); ok && u.Nickname != "" {
 			nick = u.Nickname
 		}
 		if nick != "" {
-			fmt.Fprintf(&b, "  %s — %s\n", nick, h[:8])
+			lines = append(lines, fmt.Sprintf("  %s — %s", nick, h[:8]))
 		} else {
-			fmt.Fprintf(&b, "  %s\n", h[:8])
+			lines = append(lines, fmt.Sprintf("  %s", h[:8]))
 		}
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return d.fitList("/"+label, header, lines)
+}
+
+// fitList renders header + lines joined by '\n' and truncates to fit
+// MaxReplyContentBytes. Truncation is line-aligned: it keeps as many
+// whole lines as fit, then appends "  ...and N more (see operator log)".
+// If MaxReplyContentBytes == 0 the full list is returned unmodified.
+//
+// `cmd` is the originating command name ("/users") used purely as a
+// label in the operator log when truncation fires.
+func (d *Dispatcher) fitList(cmd, header string, lines []string) string {
+	full := header
+	if len(lines) > 0 {
+		full = header + "\n" + strings.Join(lines, "\n")
+	}
+	if d.MaxReplyContentBytes <= 0 || len(full) <= d.MaxReplyContentBytes {
+		return full
+	}
+
+	// Try increasing footers and pick the largest prefix that fits.
+	// Keep at least the header and one line if possible.
+	var b strings.Builder
+	b.WriteString(header)
+	used := len(header)
+	kept := 0
+	for i, line := range lines {
+		footer := fmt.Sprintf("\n  ...and %d more (see operator log)", len(lines)-i)
+		// Need room for "\n" + line, OR "\n" + line + footer if this is the last we'd keep.
+		need := 1 + len(line)
+		// If this line plus the worst-case future footer (one more remaining) doesn't fit, stop.
+		nextFooter := fmt.Sprintf("\n  ...and %d more (see operator log)", len(lines)-i-1)
+		if used+need+len(nextFooter) > d.MaxReplyContentBytes && len(lines)-i-1 > 0 {
+			b.WriteString(footer)
+			break
+		}
+		// If this line plus current truncation footer would overflow even
+		// without further lines, stop now and emit footer covering the
+		// current+remaining lines.
+		if used+need > d.MaxReplyContentBytes {
+			b.WriteString(footer)
+			break
+		}
+		b.WriteByte('\n')
+		b.WriteString(line)
+		used += need
+		kept++
+	}
+	if kept == len(lines) {
+		// All lines fit after all — shouldn't reach here given the early
+		// return, but guard against off-by-one.
+		return full
+	}
+
+	if d.OverflowLog != nil {
+		d.OverflowLog("%s reply truncated: %d/%d entries fit in %d bytes; full reply:\n%s",
+			cmd, kept, len(lines), d.MaxReplyContentBytes, full)
+	}
+	return b.String()
 }
 
 func (d *Dispatcher) handleJoin(c *Caller) string {
@@ -253,21 +330,28 @@ var nickRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,24}$`)
 
 func (d *Dispatcher) handleNick(c *Caller, args []string) string {
 	switch len(args) {
+	case 0:
+		return "Usage: /nick <newname>   (mod/admin: /nick <user> <newname>)"
 	case 1:
 		if !c.Member {
 			return "Send /join first."
 		}
 		newNick := args[0]
 		if !nickRE.MatchString(newNick) {
-			return "Nickname must be 1-24 chars from [A-Za-z0-9_-]."
+			return "Nickname must be 1-24 chars from [A-Za-z0-9_-] (no spaces)."
 		}
 		if err := d.Roster.SetNickname(c.Hash, newNick); err != nil {
 			return "Couldn't change nickname: " + err.Error()
 		}
 		return "Nickname set to " + newNick + "."
 	case 2:
+		// A regular member who typed `/nick FIRST LAST` almost certainly
+		// meant to set their own nickname to "FIRST LAST" — not to rename
+		// some other user named FIRST. Disambiguate with a clear "no
+		// spaces" error rather than silently routing them to the
+		// permission-denied branch.
 		if !c.Role.atLeastMod() {
-			return "Only mods or admins can change someone else's nickname."
+			return "Nicknames can't contain spaces. Use a single word from [A-Za-z0-9_-] (1-24 chars)."
 		}
 		target, err := d.Roster.Resolve(args[0])
 		if err != nil {
@@ -275,14 +359,19 @@ func (d *Dispatcher) handleNick(c *Caller, args []string) string {
 		}
 		newNick := args[1]
 		if !nickRE.MatchString(newNick) {
-			return "Nickname must be 1-24 chars from [A-Za-z0-9_-]."
+			return "Nickname must be 1-24 chars from [A-Za-z0-9_-] (no spaces)."
 		}
 		if err := d.Roster.SetNickname(target.Hash, newNick); err != nil {
 			return "Couldn't change nickname: " + err.Error()
 		}
 		return fmt.Sprintf("Set %s's nickname to %s.", target.Hash[:8], newNick)
 	default:
-		return "Usage: /nick <newname>   or   /nick <user> <newname>"
+		// 3+ tokens. Whether the caller is a mod or not, the most likely
+		// intent is a multi-word nickname. Tell them so explicitly.
+		if !c.Role.atLeastMod() {
+			return "Nicknames can't contain spaces. Use a single word from [A-Za-z0-9_-] (1-24 chars)."
+		}
+		return "Usage: /nick <newname>   or   /nick <user> <newname>   (no spaces in either argument)"
 	}
 }
 
@@ -385,6 +474,37 @@ func (d *Dispatcher) handleAnnounce(role Role) string {
 		return "Announce failed: " + err.Error()
 	}
 	return "OK, announced."
+}
+
+// scrubControlBytes replaces every C0 control byte (0x00-0x1F except TAB,
+// LF, CR) and DEL (0x7F) with '?'. Used on attacker-influenced strings
+// echoed back into a reply (e.g. an unknown command name) so a sender
+// can't slip ANSI escape sequences into their own reply or into the
+// operator log line that includes that reply. Multi-byte UTF-8
+// continuation bytes (0x80-0xBF) pass through unchanged so emoji and
+// other non-ASCII content survive.
+func scrubControlBytes(s string) string {
+	clean := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7F {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7F {
+			b[i] = '?'
+		} else {
+			b[i] = c
+		}
+	}
+	return string(b)
 }
 
 func titleCase(s string) string {

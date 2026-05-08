@@ -28,6 +28,7 @@ type ServiceConfig struct {
 	IdentityPath     string   `toml:"identity_path"`
 	StatePath        string   `toml:"state_path"`
 	HistoryPath      string   `toml:"history_path"`
+	LogPath          string   `toml:"log_path"`
 	PruneAfter       Duration `toml:"prune_after"`
 	PruneInterval    Duration `toml:"prune_interval"`
 	AnnounceInterval Duration `toml:"announce_interval"`
@@ -131,6 +132,7 @@ func (c *Config) normalize() error {
 		&c.Service.IdentityPath,
 		&c.Service.StatePath,
 		&c.Service.HistoryPath,
+		&c.Service.LogPath,
 	} {
 		ex, err := ExpandPath(*p)
 		if err != nil {

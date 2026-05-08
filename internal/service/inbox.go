@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -40,10 +39,20 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// members. The dispatcher returns role/membership-aware replies.
 	if commands.IsCommand(content) {
 		parsed := commands.Parse(content)
+		s.logger.Printf("cmd from=%s name=/%s argc=%d",
+			senderHex[:8], parsed.Name, len(parsed.Args))
 		reply := s.dispatcher.Dispatch(senderHex, parsed)
 		if reply != "" {
 			if err := s.delivery.Send(senderBytes, nil, []byte(reply), nil); err != nil {
-				s.logger.Printf("command reply send: %v", err)
+				// Critical for troubleshooting: this is the path that
+				// silently broke /users when the reply outgrew the
+				// opportunistic packet cap. Always log enough detail to
+				// distinguish "recipient unknown" from "payload too big".
+				s.logger.Printf("cmd reply send failed: from=%s name=/%s reply_len=%d err=%v",
+					senderHex[:8], parsed.Name, len(reply), err)
+			} else {
+				s.logger.Printf("cmd reply sent: to=%s name=/%s reply_len=%d",
+					senderHex[:8], parsed.Name, len(reply))
 			}
 		}
 		return
@@ -91,28 +100,12 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 
 	body := "[" + senderNick + "] " + content
 
-	// Pre-check that the prefixed body will fit in a single opportunistic
-	// LXMF packet. If not, reply to the sender so they know their message
-	// wasn't relayed (rather than silently dropping it). The check here
-	// avoids iterating the whole roster just to fail identically every time.
-	if err := lxmf.CheckOpportunisticSize(nil, []byte(body), nil); err != nil {
-		if errors.Is(err, lxmf.ErrPayloadTooLarge) {
-			s.replyTooLarge(senderBytes, len(content), len(senderNick))
-			return
-		}
-		s.logger.Printf("size check: %v", err)
-		return
-	}
-
-	delivered, sizeErr := s.forwardToRoster(senderHex, body)
-	if sizeErr != nil {
-		// Defensive: pre-check passed but a per-recipient send still saw
-		// ErrPayloadTooLarge. Shouldn't happen given the body is identical,
-		// but if a future change makes Send size-sensitive per recipient,
-		// the user still gets feedback.
-		s.replyTooLarge(senderBytes, len(content), len(senderNick))
-		return
-	}
+	// Delivery.Send routes opportunistic vs link automatically based on
+	// payload size, so we no longer need a pre-flight size check or the
+	// "message too large" reply path. The MaxInboundChars policy cap
+	// above (s.cfg.Service.MaxInboundChars) is the only ceiling on
+	// content length that's still enforced here.
+	delivered := s.forwardToRoster(senderHex, body)
 
 	if delivered > 0 {
 		_ = s.history.Append(history.Entry{
@@ -121,29 +114,6 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 			SenderNick: senderNick,
 			Content:    content,
 		})
-	}
-}
-
-// replyTooLarge sends a short error message back to the original sender
-// telling them their message wasn't forwarded because, after the
-// "[nick] " prefix was added, the forwarded packet wouldn't fit in a
-// single-packet opportunistic LXMF body. Includes the approximate
-// content budget they have so they can trim accordingly.
-//
-// Distinct from replyOverInboundLimit, which fires earlier on the
-// configured spam-prevention character cap.
-func (s *Service) replyTooLarge(senderBytes []byte, contentLen, nickLen int) {
-	prefixOverhead := nickLen + 3 // "[" + nick + "] "
-	// MaxOpportunisticPayload (295) - 16 (msgpack overhead with empty title +
-	// empty fields, bin16 content prefix to be safe) - prefixOverhead.
-	budget := lxmf.MaxOpportunisticPayload - 16 - prefixOverhead
-	if budget < 0 {
-		budget = 0
-	}
-	msg := fmt.Sprintf("Message not forwarded: with the [nick] prefix it exceeds the single-packet relay limit. "+
-		"Try shortening to about %d bytes of content.", budget)
-	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
-		s.logger.Printf("too-large notify send: %v", err)
 	}
 }
 

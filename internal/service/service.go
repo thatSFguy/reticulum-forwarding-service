@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,6 +22,20 @@ import (
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/roster"
 )
+
+// replyContentBudget WAS the byte cap on command replies back when
+// Delivery.Send was opportunistic-only — large /users replies silently
+// vanished because the prefixed msgpack body exceeded
+// lxmf.MaxOpportunisticPayload (295). Since v1.1.0 Delivery.Send auto-
+// routes oversized replies through a Reticulum Link, so the cap is no
+// longer necessary: list commands return the full list and the wire
+// path is chosen for us.
+//
+// We keep the constant defined for documentation + the truncation
+// helper still works (callers that want a per-command cap can set
+// Dispatcher.MaxReplyContentBytes themselves). The dispatcher wiring
+// below uses 0 = unlimited.
+const replyContentBudget = lxmf.MaxOpportunisticPayload - 16
 
 type Service struct {
 	cfg        *config.Config
@@ -54,7 +69,11 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("load history: %w", err)
 	}
 
-	logger := log.New(os.Stdout, "fwdsvc ", log.LstdFlags)
+	logWriter, err := openLogWriter(cfg.Service.LogPath)
+	if err != nil {
+		return nil, fmt.Errorf("open log: %w", err)
+	}
+	logger := log.New(logWriter, "fwdsvc ", log.LstdFlags|log.Lmicroseconds)
 
 	id, err := loadOrCreateIdentity(cfg.Service.IdentityPath, logger)
 	if err != nil {
@@ -82,6 +101,12 @@ func New(cfg *config.Config) (*Service, error) {
 		Roster:   r,
 		Announce: svc.announceNow,
 		OnJoin:   svc.onJoin,
+		// MaxReplyContentBytes intentionally left at 0 (unlimited) — see
+		// replyContentBudget docstring. Delivery.Send routes oversize
+		// replies through Link automatically, so /users etc. return the
+		// full list regardless of roster size.
+		MaxReplyContentBytes: 0,
+		OverflowLog:          logger.Printf,
 	}
 
 	delivery.OnMessage = svc.onLXMFReceived
@@ -114,6 +139,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 	go s.transport.Run(tCtx)
 	go s.transport.AnnouncePeriodically(tCtx, s.cfg.Service.AnnounceInterval.Std(), s.buildAnnounce)
+	// RunLinkSweeper closes idle outbound links and emits KEEPALIVE on
+	// active ones so the responder doesn't tear them down for inactivity.
+	go s.transport.RunLinkSweeper(tCtx)
 
 	pruneTicker := time.NewTicker(s.cfg.Service.PruneInterval.Std())
 	defer pruneTicker.Stop()
@@ -222,6 +250,27 @@ func (t *announceTap) OnAnnounce(a *rns.Announce) {
 	if err := t.svc.roster.UpdateLastAnnounce(a.DestHash, t.svc.now()); err != nil {
 		t.svc.logger.Printf("announce update: %v", err)
 	}
+}
+
+// openLogWriter returns an io.Writer for the daemon logger. Stdout is
+// always included so operators running fwdsvc in the foreground keep
+// seeing output. If logPath is non-empty, the file is opened in append
+// mode (mode 0600 — log lines may include user dest_hashes) and tee'd
+// alongside stdout via io.MultiWriter; the file handle leaks
+// intentionally (its lifetime is the process). On any open error the
+// caller decides whether to fail startup.
+func openLogWriter(logPath string) (io.Writer, error) {
+	if logPath == "" {
+		return os.Stdout, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return io.MultiWriter(os.Stdout, f), nil
 }
 
 // stdLoggerAdapter bridges a *log.Logger into rns.Logger.

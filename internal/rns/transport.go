@@ -2,6 +2,8 @@ package rns
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -35,6 +37,11 @@ type Transport struct {
 	pathRequestsSent map[string]time.Time // key: hex dest_hash, dedup window
 
 	linkManager *LinkManager
+
+	// lifetime is the configurable timing for RunLinkSweeper. Lazily
+	// initialised to defaults on first read so tests that never start
+	// the sweeper don't have to set anything.
+	lifetime *linkLifetime
 
 	logger Logger
 }
@@ -324,11 +331,18 @@ func (t *Transport) dispatch(raw []byte) {
 			t.handleLRProof(p)
 			return
 		}
-		// Other proofs (opportunistic-DATA proofs we get back, or link
-		// DATA proofs from the other end) — we don't track outstanding
-		// PacketReceipts on our outbound packets, so we drop them silently
-		// here. Future PR will validate them when we want delivery
-		// confirmation on our own sends.
+		if p.DestinationType == DestinationLink && p.Context == ContextNone {
+			// Explicit-form link DATA proof acknowledging an outbound
+			// link DATA we sent as initiator. Validates the signature
+			// against the responder's cached long-term Ed25519 pub and
+			// signals the matching SendOverLink waiter.
+			t.handleLinkProof(p)
+			return
+		}
+		// Opportunistic-DATA proofs come back at us when we send
+		// opportunistic LXMF, but we don't track outstanding
+		// PacketReceipts there yet, so we drop them silently. Future PR
+		// could plumb delivery confirmation through to Delivery.Send.
 	}
 }
 
@@ -517,29 +531,410 @@ func (t *Transport) handleLinkData(p *Packet) {
 	// Emit the explicit-form link DATA proof BEFORE returning so the
 	// sender's PacketReceipt can resolve quickly. (SPEC §6.5.6 — without
 	// this the sender retransmits and eventually tears the link down.)
-	// Per upstream RNS/Link.py:279 the responder signs with its
-	// destination identity's long-term Ed25519 priv (NOT a link-derived
-	// shared key — the initiator can't reproduce HKDF output, so a shared
-	// key would never validate on their side).
+	//
+	// Two paths depending on which side of the handshake we are:
+	//
+	//   responder side (responderIdentity != nil): sign with our
+	//   destination identity's long-term Ed25519 priv per upstream
+	//   RNS/Link.py:279. The initiator validates against our long-term
+	//   pub (it cached that pub when it looked us up to send the
+	//   LINKREQUEST).
+	//
+	//   initiator side (initiatorEd25519Priv != nil): sign with the
+	//   ephemeral Ed25519 priv we generated at link-creation time. The
+	//   responder validates against the ephemeral pub bytes carried in
+	//   the LINKREQUEST body (which it already parsed and verified).
+	//
+	// A link should always have exactly one of these set; if neither
+	// (test paths constructing Links manually), we skip and log.
 	link.mu.Lock()
 	signer := link.responderIdentity
+	initPriv := link.initiatorEd25519Priv
 	linkID := link.ID
 	link.mu.Unlock()
-	if signer == nil {
-		// Only happens if we're the initiator side of this link (we don't
-		// currently send link DATA proofs as initiator) or if the link was
-		// constructed without an identity (test paths). Logged so an
-		// operator can see ack failures distinct from network problems.
-		t.logger.Printf("link PROOF skipped: no responder identity for link=%x", linkID[:4])
+
+	var sign func([]byte) []byte
+	switch {
+	case signer != nil:
+		sign = signer.Sign
+	case initPriv != nil:
+		sign = func(msg []byte) []byte { return ed25519.Sign(initPriv, msg) }
+	default:
+		t.logger.Printf("link PROOF skipped: no signing key for link=%x", linkID[:4])
 		return
 	}
-	proof, err := BuildLinkProof(linkID, signer.Sign, p)
+	proof, err := BuildLinkProof(linkID, sign, p)
 	if err != nil {
 		t.logger.Printf("build link proof: %v", err)
 		return
 	}
 	if err := t.Broadcast(proof); err != nil {
 		t.logger.Printf("broadcast link proof: %v", err)
+	}
+}
+
+// Sentinel errors returned by SendOverLink so callers can branch on
+// failure mode (timeout vs. peer-unknown vs. handshake failure) without
+// string-matching.
+var (
+	ErrLinkPeerUnknown    = errors.New("link send: peer has not announced; cannot open link")
+	ErrLinkHandshakeTimeout = errors.New("link send: LRPROOF did not arrive before timeout")
+	ErrLinkProofTimeout   = errors.New("link send: link DATA proof did not arrive before timeout")
+	ErrLinkSendFailed     = errors.New("link send: broadcast failed")
+)
+
+// DefaultLinkSendTimeout is the per-call ceiling for the entire
+// SendOverLink operation: handshake (if any) + DATA broadcast + proof
+// wait. Chosen to absorb a 2-hop relay round-trip on a slow LoRa segment
+// without giving up too eagerly. Override per call by passing a smaller
+// timeout when the caller knows the peer is direct.
+const DefaultLinkSendTimeout = 30 * time.Second
+
+// SendOverLink delivers `plaintext` to `responderDestHash` over a
+// Reticulum Link, opening one lazily if no Active link to that peer
+// exists. Blocks until the responder's explicit-form link DATA proof
+// arrives, or until `timeout` elapses.
+//
+// Returns nil on successful proof receipt. ErrLinkPeerUnknown if the
+// responder has never announced. ErrLinkHandshakeTimeout if the
+// LINKREQUEST/LRPROOF round-trip doesn't complete in time.
+// ErrLinkProofTimeout if the DATA went out but no proof returned.
+//
+// Concurrent SendOverLink calls to the same peer that find no Active
+// link will each open their own Link — wasteful but not broken; PR3
+// adds coalescing. Concurrent calls on the SAME Link are serialized
+// inside the link's pendingProofs map (each send registers under its
+// own packet_hash) and may proceed in parallel.
+func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, timeout time.Duration) error {
+	if len(responderDestHash) != IdentityHashLen {
+		return fmt.Errorf("responder dest_hash must be %d bytes, got %d", IdentityHashLen, len(responderDestHash))
+	}
+	if timeout <= 0 {
+		timeout = DefaultLinkSendTimeout
+	}
+	deadline := time.Now().Add(timeout)
+
+	link, err := t.acquireLinkTo(responderDestHash, deadline)
+	if err != nil {
+		return err
+	}
+
+	// Snapshot session keys + peer-pub under the link mutex so a
+	// concurrent teardown can't race with our broadcast.
+	link.mu.Lock()
+	if link.State != LinkActive {
+		state := link.State
+		link.mu.Unlock()
+		return fmt.Errorf("link send: link state is %s, want active", state)
+	}
+	signing := append([]byte(nil), link.Signing...)
+	encryption := append([]byte(nil), link.Encryption...)
+	linkID := append([]byte(nil), link.ID...)
+	link.mu.Unlock()
+
+	dataPkt, err := BuildLinkDataPacket(linkID, signing, encryption, plaintext)
+	if err != nil {
+		return fmt.Errorf("link send: build DATA: %w", err)
+	}
+
+	// If the peer was reached via a transit relay (HEADER_2 announce),
+	// route the link DATA the same way. Without this, multi-hop responders
+	// would never receive our long forwards.
+	if known := t.Recall(responderDestHash); known != nil {
+		applyMultihopRouting(dataPkt, known.TransportID)
+	}
+
+	// Compute the packet_hash the responder will sign. MUST use the SAME
+	// hashable_part the responder sees — HashablePart is invariant under
+	// HEADER_1↔HEADER_2 (it strips the transport_id slot), so this works
+	// identically for direct and multi-hop peers.
+	hashable, err := dataPkt.HashablePart()
+	if err != nil {
+		return fmt.Errorf("link send: hashable: %w", err)
+	}
+	digest := sha256SumLen32(hashable)
+	hashHex := hex.EncodeToString(digest[:])
+
+	// Register the waiter BEFORE broadcasting. If the responder is fast
+	// enough to ack before we broadcast returns, the dispatcher would
+	// otherwise drop the proof on the floor.
+	waiter := link.registerProofWaiter(hashHex)
+	defer link.clearProofWaiter(hashHex)
+
+	if err := t.Broadcast(dataPkt); err != nil {
+		return fmt.Errorf("%w: %v", ErrLinkSendFailed, err)
+	}
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return ErrLinkProofTimeout
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case proofErr := <-waiter:
+		return proofErr
+	case <-timer.C:
+		return ErrLinkProofTimeout
+	}
+}
+
+// acquireLinkTo returns an Active Link to peer. Reuses an existing
+// Active link if one exists; otherwise opens a new one and waits for
+// the LRPROOF to arrive. `deadline` bounds the handshake wait.
+//
+// If the responder is multi-hop (KnownIdentity.TransportID set from a
+// HEADER_2 announce that arrived via a relay), the LINKREQUEST is
+// emitted as HEADER_2 with that transport_id so transit relays can
+// route it to the responder. The link_id derivation is invariant under
+// HEADER_1↔HEADER_2 conversion (HashablePart strips the transport_id
+// slot — see packet.go), so both sides agree on the link_id either way.
+func (t *Transport) acquireLinkTo(responderDestHash []byte, deadline time.Time) (*Link, error) {
+	if existing := t.linkManager.ActiveTo(responderDestHash); existing != nil {
+		return existing, nil
+	}
+	known := t.Recall(responderDestHash)
+	if known == nil {
+		return nil, ErrLinkPeerUnknown
+	}
+
+	link, lrReq, err := t.linkManager.StartLinkAsInitiator(responderDestHash, nil /* signalling */)
+	if err != nil {
+		return nil, fmt.Errorf("start link: %w", err)
+	}
+	applyMultihopRouting(lrReq, known.TransportID)
+	if err := t.Broadcast(lrReq); err != nil {
+		t.linkManager.CloseLink(link.ID)
+		return nil, fmt.Errorf("%w: broadcast LINKREQUEST: %v", ErrLinkSendFailed, err)
+	}
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		t.linkManager.CloseLink(link.ID)
+		return nil, ErrLinkHandshakeTimeout
+	}
+	cancelled := make(chan struct{})
+	timer := time.AfterFunc(remaining, func() { close(cancelled) })
+	defer timer.Stop()
+
+	if err := link.AwaitActive(cancelled); err != nil {
+		// Whether we timed out or got a closed link, drop it from the
+		// manager so a retry doesn't trip over a Pending stub.
+		t.linkManager.CloseLink(link.ID)
+		if !timer.Stop() && time.Now().After(deadline) {
+			return nil, ErrLinkHandshakeTimeout
+		}
+		return nil, fmt.Errorf("link handshake: %w", err)
+	}
+	return link, nil
+}
+
+// handleLinkProof is invoked for inbound PROOF packets whose outer
+// header has dest_type=LINK and context=NONE — the explicit-form link
+// DATA proof a responder emits to ack our outbound link DATA. Validates
+// the signature against the responder's cached long-term Ed25519 pub
+// and signals the matching pendingProofs waiter (if any).
+//
+// Logged-but-not-errored on failure: dispatcher must keep going.
+func (t *Transport) handleLinkProof(p *Packet) {
+	link := t.linkManager.Get(p.DestHash)
+	if link == nil {
+		t.logger.Printf("link DATA proof for unknown link_id %x", p.DestHash[:4])
+		return
+	}
+	link.mu.Lock()
+	peerPub := link.peerEd25519Pub
+	link.mu.Unlock()
+	if peerPub == nil {
+		// Responder side — they emit proofs but don't validate them. Or
+		// a still-Pending initiator that somehow received a proof first
+		// (shouldn't happen).
+		return
+	}
+
+	packetHash, err := ValidateLinkProof(p, peerPub)
+	if err != nil {
+		t.logger.Printf("link DATA proof reject: %v", err)
+		return
+	}
+	link.mu.Lock()
+	link.LastActivity = time.Now()
+	link.mu.Unlock()
+	if !link.signalProof(hex.EncodeToString(packetHash), nil) {
+		// No waiter — proof for a packet we didn't track (e.g. a
+		// duplicate ack, or an ack that arrived after our wait timed
+		// out). Logged at debug-equivalent so an operator chasing
+		// retransmits can see them.
+		t.logger.Printf("link DATA proof: no waiter for packet_hash %x (link=%x)", packetHash[:4], link.ID[:4])
+	}
+}
+
+// sha256SumLen32 is a tiny helper that wraps sha256.Sum256 so callers
+// don't need an extra import for one line.
+func sha256SumLen32(b []byte) [32]byte { return sha256.Sum256(b) }
+
+// applyMultihopRouting promotes a HEADER_1 broadcast packet to HEADER_2
+// network-transport with the given transport_id, so transit relays can
+// route it to a multi-hop peer. No-op when transportID is empty (the
+// peer announced directly).
+//
+// Mutates the packet in place. The caller MUST have computed link_id /
+// packet_hash from a HEADER_1 form OR be aware that HashablePart is
+// invariant under HEADER_1↔HEADER_2 conversion (the transport_id slot
+// is stripped before hashing — see packet.go HashablePart).
+func applyMultihopRouting(p *Packet, transportID []byte) {
+	if len(transportID) != IdentityHashLen {
+		return
+	}
+	p.HeaderType = HeaderType2
+	p.TransportType = NetworkTransport
+	p.TransportID = append([]byte(nil), transportID...)
+}
+
+// Default lifetime parameters for outbound links. Conservative: KEEPALIVE
+// often enough to keep upstream's STAY_TIME timer (~10 min) from firing,
+// idle teardown long after a peer would have torn down on their own.
+// Both can be overridden per-Transport via SetLinkLifetime.
+const (
+	DefaultLinkKeepaliveInterval = 4 * time.Minute
+	DefaultLinkIdleTimeout       = 15 * time.Minute
+	DefaultLinkSweepInterval     = 30 * time.Second
+)
+
+// linkLifetime carries the configurable timing for the link sweeper.
+// Held inside Transport; immutable after Run starts to avoid surprises.
+type linkLifetime struct {
+	keepalive time.Duration
+	idle      time.Duration
+	sweep     time.Duration
+}
+
+// SetLinkLifetime overrides the default keepalive/idle/sweep parameters.
+// Must be called before RunLinkSweeper. Zero values keep the defaults.
+func (t *Transport) SetLinkLifetime(keepalive, idle, sweep time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lifetime == nil {
+		t.lifetime = &linkLifetime{}
+	}
+	if keepalive > 0 {
+		t.lifetime.keepalive = keepalive
+	}
+	if idle > 0 {
+		t.lifetime.idle = idle
+	}
+	if sweep > 0 {
+		t.lifetime.sweep = sweep
+	}
+}
+
+// RunLinkSweeper periodically scans the LinkManager and:
+//  1. Emits a KEEPALIVE packet on Active outbound (initiator-side) links
+//     whose LastActivity is older than the keepalive interval, so the
+//     responder doesn't tear them down for inactivity.
+//  2. Closes any Active link (initiator OR responder side) idle longer
+//     than the idle timeout, freeing state.
+//
+// Run as a goroutine alongside Transport.Run. Returns when ctx is done.
+func (t *Transport) RunLinkSweeper(ctx context.Context) {
+	t.mu.Lock()
+	if t.lifetime == nil {
+		t.lifetime = &linkLifetime{}
+	}
+	if t.lifetime.keepalive == 0 {
+		t.lifetime.keepalive = DefaultLinkKeepaliveInterval
+	}
+	if t.lifetime.idle == 0 {
+		t.lifetime.idle = DefaultLinkIdleTimeout
+	}
+	if t.lifetime.sweep == 0 {
+		t.lifetime.sweep = DefaultLinkSweepInterval
+	}
+	sweepInterval := t.lifetime.sweep
+	t.mu.Unlock()
+
+	tick := time.NewTicker(sweepInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			t.sweepLinks()
+		}
+	}
+}
+
+// sweepLinks is one pass of the link housekeeping loop. Exposed so
+// tests can drive it deterministically without depending on the ticker.
+func (t *Transport) sweepLinks() {
+	t.mu.RLock()
+	keepalive := t.lifetime.keepalive
+	idle := t.lifetime.idle
+	t.mu.RUnlock()
+
+	now := time.Now()
+	type action struct {
+		linkID    []byte
+		keepalive bool
+		close     bool
+	}
+	var actions []action
+
+	t.linkManager.mu.Lock()
+	for _, l := range t.linkManager.links {
+		l.mu.Lock()
+		if l.State != LinkActive {
+			l.mu.Unlock()
+			continue
+		}
+		isInitiator := l.responderIdentity == nil && l.peerDestHash != nil
+		idleFor := now.Sub(l.LastActivity)
+		linkID := append([]byte(nil), l.ID...)
+		l.mu.Unlock()
+
+		switch {
+		case idleFor >= idle:
+			actions = append(actions, action{linkID: linkID, close: true})
+		case isInitiator && idleFor >= keepalive:
+			actions = append(actions, action{linkID: linkID, keepalive: true})
+		}
+	}
+	t.linkManager.mu.Unlock()
+
+	for _, a := range actions {
+		if a.close {
+			t.logger.Printf("link sweep: closing idle link %x", a.linkID[:4])
+			t.linkManager.CloseLink(a.linkID)
+			continue
+		}
+		if a.keepalive {
+			pkt, err := BuildLinkKeepalive(a.linkID)
+			if err != nil {
+				t.logger.Printf("link sweep: build keepalive: %v", err)
+				continue
+			}
+			// Re-route via HEADER_2 if the peer is multi-hop.
+			if l := t.linkManager.Get(a.linkID); l != nil {
+				peer := l.PeerDestHash()
+				if peer != nil {
+					if known := t.Recall(peer); known != nil {
+						applyMultihopRouting(pkt, known.TransportID)
+					}
+				}
+			}
+			if err := t.Broadcast(pkt); err != nil {
+				t.logger.Printf("link sweep: broadcast keepalive: %v", err)
+				continue
+			}
+			// Bump LastActivity so we don't immediately re-emit on the
+			// next tick if keepalive is short and broadcast takes time.
+			if l := t.linkManager.Get(a.linkID); l != nil {
+				l.mu.Lock()
+				l.LastActivity = time.Now()
+				l.mu.Unlock()
+			}
+		}
 	}
 }
 

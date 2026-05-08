@@ -3,6 +3,7 @@ package lxmf
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
 )
@@ -28,6 +29,12 @@ type Delivery struct {
 	// OnError is called when an inbound packet can't be decrypted, parsed,
 	// or verified. Implementations typically log.
 	OnError func(error)
+
+	// LinkSendTimeout caps the total elapsed time SendLink (or Send when
+	// it falls through to link delivery) will spend on a single message:
+	// LINKREQUEST/LRPROOF round-trip + DATA broadcast + DATA proof wait.
+	// Defaults to rns.DefaultLinkSendTimeout (30s) when zero.
+	LinkSendTimeout time.Duration
 }
 
 // NewDelivery registers the LXMF delivery destination for `identity` on
@@ -63,10 +70,23 @@ func (d *Delivery) Hash() []byte {
 // Identity returns the underlying identity.
 func (d *Delivery) Identity() *rns.Identity { return d.identity }
 
-// Send builds an opportunistic LXMF message, Token-encrypts it for
-// `recipientDestHash`, wraps it in a Reticulum DATA packet, and broadcasts
-// it. The recipient MUST have announced previously, since we need their
-// X25519 public key to encrypt; otherwise this returns an error.
+// Send delivers an LXMF message to `recipientDestHash`. Routes
+// automatically:
+//
+//   - If the message fits the opportunistic single-packet cap
+//     (MaxOpportunisticPayload, 295 bytes msgpack), it is sent in one
+//     Token-encrypted Reticulum DATA packet — fire-and-forget, returns
+//     as soon as Broadcast returns.
+//   - If it would overflow that cap, falls through to link delivery:
+//     opens a Reticulum Link to the recipient (handshake) if no Active
+//     one exists, then sends the LXMF body in direct form on the link
+//     and BLOCKS until the responder's link DATA proof arrives or the
+//     LinkSendTimeout elapses.
+//
+// The recipient MUST have announced previously, since we need their
+// X25519 public key to encrypt opportunistically and their long-term
+// Ed25519 public key to verify the LRPROOF + link DATA proofs. An
+// unknown recipient yields an error before any wire activity.
 func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields map[any]any) error {
 	if len(recipientDestHash) != rns.IdentityHashLen {
 		return fmt.Errorf("recipient dest_hash must be %d bytes", rns.IdentityHashLen)
@@ -76,14 +96,20 @@ func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields 
 		return fmt.Errorf("recipient %x has not announced; cannot encrypt", recipientDestHash[:4])
 	}
 
-	// Recipient's identity hash drives the Token HKDF salt (SPEC §3.2).
-	recipientIdentityHash := identityHashFromPublic(known.PublicKey)
-
+	// Try opportunistic first. signAndPackOpportunisticAt fails fast with
+	// ErrPayloadTooLarge before doing any crypto if the payload won't
+	// fit, so this branch costs at most one msgpack marshal for messages
+	// that route to link delivery.
 	body, err := SignAndPackOpportunistic(d.identity, d.destHash, recipientDestHash, title, content, fields)
 	if err != nil {
+		if errors.Is(err, ErrPayloadTooLarge) {
+			return d.sendOverLink(recipientDestHash, title, content, fields)
+		}
 		return fmt.Errorf("pack: %w", err)
 	}
 
+	// Recipient's identity hash drives the Token HKDF salt (SPEC §3.2).
+	recipientIdentityHash := identityHashFromPublic(known.PublicKey)
 	ciphertext, err := rns.TokenEncrypt(body, known.X25519Public(), recipientIdentityHash)
 	if err != nil {
 		return fmt.Errorf("encrypt: %w", err)
@@ -91,6 +117,28 @@ func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields 
 
 	pkt := buildOutboundPacket(recipientDestHash, ciphertext, known.TransportID)
 	return d.transport.Broadcast(pkt)
+}
+
+// sendOverLink is the link-delivery fallback path used by Send when the
+// opportunistic msgpack payload would exceed MaxOpportunisticPayload.
+// Builds the LXMF body in direct form (SPEC §5.2 — destination_hash is
+// in the body because the outer Reticulum packet is addressed to a
+// link_id, not the recipient destination), then hands the bytes to
+// rns.Transport.SendOverLink which manages the link state machine and
+// blocks for the responder's proof.
+func (d *Delivery) sendOverLink(recipientDestHash, title, content []byte, fields map[any]any) error {
+	directBody, err := SignAndPackDirect(d.identity, d.destHash, recipientDestHash, title, content, fields)
+	if err != nil {
+		return fmt.Errorf("pack direct: %w", err)
+	}
+	timeout := d.LinkSendTimeout
+	if timeout <= 0 {
+		timeout = rns.DefaultLinkSendTimeout
+	}
+	if err := d.transport.SendOverLink(recipientDestHash, directBody, timeout); err != nil {
+		return fmt.Errorf("link send: %w", err)
+	}
+	return nil
 }
 
 // buildOutboundPacket frames the encrypted LXMF body as a Reticulum DATA

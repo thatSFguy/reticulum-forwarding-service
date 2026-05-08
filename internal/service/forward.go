@@ -2,22 +2,23 @@ package service
 
 import (
 	"encoding/hex"
-	"errors"
-
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
 )
 
 // forwardToRoster fans the body out to every ACTIVE (non-paused) roster
 // member except the sender. Each Send drops silently with a log entry
 // if the recipient hasn't announced yet (we can't encrypt to an unknown
-// public key). Returns the count of recipients we successfully queued
-// sends for, plus the first lxmf.ErrPayloadTooLarge encountered (the
-// error is the same for every recipient — the body is identical — so
-// surfacing it lets the caller reply to the original sender once).
-func (s *Service) forwardToRoster(senderHex, body string) (int, error) {
+// public key) or if a link delivery fails. Returns the count of
+// recipients we successfully delivered to.
+//
+// Delivery.Send routes opportunistic vs link automatically — large
+// bodies that overflow the opportunistic single-packet cap fall through
+// to a per-recipient Reticulum Link send, which blocks for the
+// responder's ack. With a large roster + large body, this loop is
+// SERIAL and slow (PR3 will parallelize). Acceptable for now since the
+// dominant case is short messages routing to opportunistic.
+func (s *Service) forwardToRoster(senderHex, body string) int {
 	hashes := s.roster.ActiveHashes()
 	delivered := 0
-	var sizeErr error
 	for _, h := range hashes {
 		if h == senderHex {
 			continue
@@ -27,16 +28,10 @@ func (s *Service) forwardToRoster(senderHex, body string) (int, error) {
 			continue
 		}
 		if err := s.delivery.Send(raw, nil, []byte(body), nil); err != nil {
-			if errors.Is(err, lxmf.ErrPayloadTooLarge) {
-				// Identical body fails identically for everyone — abort
-				// and let the caller reply to the sender.
-				sizeErr = err
-				break
-			}
 			s.logger.Printf("forward to %s: %v", h[:8], err)
 			continue
 		}
 		delivered++
 	}
-	return delivered, sizeErr
+	return delivered
 }

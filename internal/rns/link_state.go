@@ -1,6 +1,7 @@
 package rns
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -61,9 +62,38 @@ type Link struct {
 
 	// Initiator-side state used while Pending: ephemeral X25519 priv we
 	// sent in the LINKREQUEST, plus the peer destination we addressed.
-	// Cleared once the link transitions to Active.
+	// X25519 priv is cleared once the link transitions to Active; the
+	// destination hash is retained for the lifetime of the link so we
+	// can route outbound DATA without re-walking caller state.
 	myEphemeralX25519Priv []byte
 	peerDestHash          []byte
+
+	// initiatorEd25519Priv is the ephemeral Ed25519 private key whose
+	// public half we put in the LINKREQUEST body. Per upstream RNS this
+	// is what an initiator uses to sign link DATA proofs for return-
+	// direction traffic (responder → initiator) — the responder verifies
+	// against initiatorEd25519Pub from the LINKREQUEST. Retained for the
+	// life of the link. PR2 will add the signing path that consumes this.
+	initiatorEd25519Priv []byte
+
+	// peerEd25519Pub is the long-term Ed25519 public key of the responder.
+	// Captured at HandleLRProof time when we are the initiator (not on
+	// the LRPROOF wire — taken from the responder's prior announce). Used
+	// by Transport.handleLinkProof to verify inbound link DATA proofs
+	// the responder signs to ack our outbound DATA.
+	peerEd25519Pub []byte
+
+	// pendingProofs maps hex(packet_hash) → channel that SendOverLink
+	// blocks on. handleLinkProof closes the channel (with nil) on
+	// successful proof verification, or sends an error on bad-sig.
+	// Senders MUST register the channel BEFORE broadcasting the link
+	// DATA packet to avoid losing a fast proof.
+	pendingProofs map[string]chan error
+
+	// activatedCh is closed exactly once when the initiator-side link
+	// transitions Pending → Active. Lets SendOverLink block on the
+	// handshake completing without polling. Nil on the responder side.
+	activatedCh chan struct{}
 
 	// Responder-side state: the responder's ephemeral X25519 priv we
 	// generated to derive session keys. Cleared once Active.
@@ -84,6 +114,105 @@ type Link struct {
 	// OnInboundData is called from the Transport's dispatcher with each
 	// successfully decrypted link DATA payload. Non-nil during Active.
 	OnInboundData func(plaintext []byte)
+}
+
+// IsInitiator returns true when this Link was opened locally (we sent
+// the LINKREQUEST). Initiator-side links carry initiatorEd25519Priv
+// and peerEd25519Pub; responder-side links carry responderIdentity.
+func (l *Link) IsInitiator() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.responderIdentity == nil && l.peerDestHash != nil
+}
+
+// PeerDestHash returns a copy of the peer's destination hash for an
+// initiator-side link, or nil for a responder-side link.
+func (l *Link) PeerDestHash() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.peerDestHash == nil {
+		return nil
+	}
+	out := make([]byte, len(l.peerDestHash))
+	copy(out, l.peerDestHash)
+	return out
+}
+
+// AwaitActive blocks until the link transitions to Active (closing
+// activatedCh) or until ctx fires. Returns nil on Active, the ctx
+// error otherwise. Returns immediately if the link is already Active
+// or Closed.
+func (l *Link) AwaitActive(ctxDone <-chan struct{}) error {
+	l.mu.Lock()
+	state := l.State
+	ch := l.activatedCh
+	l.mu.Unlock()
+	switch state {
+	case LinkActive:
+		return nil
+	case LinkClosed:
+		return errors.New("link closed before activation")
+	}
+	if ch == nil {
+		// Responder-side link or one constructed without an activatedCh.
+		return errors.New("link has no activation channel")
+	}
+	select {
+	case <-ch:
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if l.State != LinkActive {
+			return fmt.Errorf("link not Active after activation signal (state=%s)", l.State)
+		}
+		return nil
+	case <-ctxDone:
+		return errors.New("link activation cancelled")
+	}
+}
+
+// registerProofWaiter atomically inserts a fresh channel keyed by
+// hex(packetHash) into pendingProofs and returns the channel. The
+// caller MUST call clearProofWaiter when done (typically via defer).
+//
+// Returning a buffered channel makes handleLinkProof's signal a
+// non-blocking send so a slow waiter doesn't deadlock the dispatcher.
+func (l *Link) registerProofWaiter(packetHashHex string) chan error {
+	ch := make(chan error, 1)
+	l.mu.Lock()
+	if l.pendingProofs == nil {
+		l.pendingProofs = map[string]chan error{}
+	}
+	l.pendingProofs[packetHashHex] = ch
+	l.mu.Unlock()
+	return ch
+}
+
+func (l *Link) clearProofWaiter(packetHashHex string) {
+	l.mu.Lock()
+	delete(l.pendingProofs, packetHashHex)
+	l.mu.Unlock()
+}
+
+// signalProof is used by Transport.handleLinkProof to wake a SendOverLink
+// caller. Returns true if a waiter was found (and signalled), false if
+// no one was waiting on this packet_hash. err may be nil to indicate
+// success or non-nil for a bad-sig / wrong-link diagnostic the caller
+// can surface.
+func (l *Link) signalProof(packetHashHex string, err error) bool {
+	l.mu.Lock()
+	ch, ok := l.pendingProofs[packetHashHex]
+	if ok {
+		delete(l.pendingProofs, packetHashHex)
+	}
+	l.mu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case ch <- err:
+	default:
+	}
+	return true
 }
 
 // IsActive returns true iff State == LinkActive.
@@ -164,9 +293,11 @@ func (lm *LinkManager) StartLinkAsInitiator(responderDestHash []byte, sig *LinkS
 		return nil, nil, err
 	}
 	// Initiator's ephemeral Ed25519 (per SPEC §6.1, both ephemerals are
-	// fresh — they are NOT the long-term identity keys). Used by upstream
-	// for some additional handshake flows; we include it on the wire as
-	// required even though we don't use it for our own DATA proofs.
+	// fresh — they are NOT the long-term identity keys). Per upstream
+	// RNS the initiator uses this priv to sign link DATA proofs for
+	// return-direction traffic; the responder verifies against the pub
+	// bytes carried in the LINKREQUEST. We retain the priv on the Link
+	// for that purpose (PR2 wires the actual signing path).
 	var ephEd25519Seed [32]byte
 	if _, err := rand.Read(ephEd25519Seed[:]); err != nil {
 		return nil, nil, fmt.Errorf("Ed25519 seed entropy: %w", err)
@@ -175,6 +306,7 @@ func (lm *LinkManager) StartLinkAsInitiator(responderDestHash []byte, sig *LinkS
 	if err != nil {
 		return nil, nil, fmt.Errorf("derive ephemeral identity: %w", err)
 	}
+	ephEd25519Priv := ed25519.NewKeyFromSeed(ephEd25519Seed[:])
 
 	pkt, err := BuildLinkRequest(ephPub, ephID.PublicKey()[32:], responderDestHash, sig)
 	if err != nil {
@@ -189,7 +321,10 @@ func (lm *LinkManager) StartLinkAsInitiator(responderDestHash []byte, sig *LinkS
 		ID:                    id,
 		State:                 LinkPending,
 		myEphemeralX25519Priv: ephPriv,
+		initiatorEd25519Priv:  ephEd25519Priv,
 		peerDestHash:          append([]byte(nil), responderDestHash...),
+		pendingProofs:         map[string]chan error{},
+		activatedCh:           make(chan struct{}),
 		CreatedAt:             time.Now(),
 		LastActivity:          time.Now(),
 	}
@@ -221,12 +356,14 @@ func (lm *LinkManager) HandleLRProof(p *Packet, responderEd25519Pub []byte) (*Li
 	}
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.State != LinkPending {
-		return nil, fmt.Errorf("LRPROOF for link in state %s, want pending", l.State)
+		state := l.State
+		l.mu.Unlock()
+		return nil, fmt.Errorf("LRPROOF for link in state %s, want pending", state)
 	}
 	signing, encryption, err := DeriveLinkSessionKeys(l.myEphemeralX25519Priv, parsed.ResponderX25519Pub, parsed.LinkID)
 	if err != nil {
+		l.mu.Unlock()
 		return nil, fmt.Errorf("derive session keys: %w", err)
 	}
 	l.Signing = signing
@@ -234,6 +371,18 @@ func (lm *LinkManager) HandleLRProof(p *Packet, responderEd25519Pub []byte) (*Li
 	l.State = LinkActive
 	l.LastActivity = time.Now()
 	l.myEphemeralX25519Priv = nil // no longer needed
+	// Cache responder's long-term Ed25519 pubkey so handleLinkProof can
+	// validate ack proofs against it without round-tripping through
+	// Recall (which could miss if the known table evicted the entry).
+	l.peerEd25519Pub = append([]byte(nil), responderEd25519Pub...)
+	activated := l.activatedCh
+	l.mu.Unlock()
+	if activated != nil {
+		// Close exactly once. Pending → Active transition is the only
+		// place that closes; HandleLRProof guards on State == Pending so
+		// we won't reach here twice.
+		close(activated)
+	}
 	return l, nil
 }
 
