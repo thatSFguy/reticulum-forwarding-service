@@ -80,21 +80,26 @@ func (noopLogger) Printf(string, ...any) {}
 // KnownIdentity is what we remember after a verified announce. It lets the
 // LXMF send path Token-encrypt to the recipient (we need their X25519 pub)
 // and prove the source on inbound (we need their Ed25519 pub).
+//
+// The JSON tags exist so callers can persist the cache to disk and
+// restore it on startup via Transport.Restore — without that, a service
+// restart loses every learned peer until they re-announce (up to the
+// configured AnnounceInterval, default 10 minutes).
 type KnownIdentity struct {
-	DestHash   []byte
-	PublicKey  []byte // 64 bytes (X25519 || Ed25519)
-	NameHash   []byte
-	AppData    []byte
-	LastSeen   time.Time
-	LastRandom []byte // last seen random_hash, for cheap replay-defence dedup
-	Hops       byte
+	DestHash   []byte    `json:"dest_hash"`
+	PublicKey  []byte    `json:"public_key"` // 64 bytes (X25519 || Ed25519)
+	NameHash   []byte    `json:"name_hash"`
+	AppData    []byte    `json:"app_data"`
+	LastSeen   time.Time `json:"last_seen"`
+	LastRandom []byte    `json:"last_random"` // last seen random_hash, for cheap replay-defence dedup
+	Hops       byte      `json:"hops"`
 
 	// TransportID is the next-hop transport node's identity hash for
 	// multi-hop sends, captured from the announce's outer packet header
 	// when it arrived as HEADER_2. Nil if the destination announced
 	// directly (HEADER_1). Used by Delivery.Send to decide whether to
 	// emit HEADER_2 with TransportType=NetworkTransport (SPEC §2.3).
-	TransportID []byte
+	TransportID []byte `json:"transport_id,omitempty"`
 }
 
 // X25519Public returns the first 32 bytes of PublicKey — the X25519 half.
@@ -226,6 +231,58 @@ func (t *Transport) Recall(destHash []byte) *KnownIdentity {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.known[hex.EncodeToString(destHash)]
+}
+
+// Restore inserts a previously-verified KnownIdentity into the cache —
+// used at startup to repopulate from a persistent store so a service
+// restart doesn't have to wait for every peer to re-announce. Skips
+// invalid entries (wrong-length DestHash or PublicKey) silently so a
+// corrupt store can't crash the daemon. Deep-copies byte slices to
+// avoid sharing storage with the caller.
+func (t *Transport) Restore(k *KnownIdentity) {
+	if k == nil ||
+		len(k.DestHash) != IdentityHashLen ||
+		len(k.PublicKey) != PublicKeyLen {
+		return
+	}
+	cp := &KnownIdentity{
+		DestHash:   append([]byte(nil), k.DestHash...),
+		PublicKey:  append([]byte(nil), k.PublicKey...),
+		NameHash:   append([]byte(nil), k.NameHash...),
+		AppData:    append([]byte(nil), k.AppData...),
+		LastSeen:   k.LastSeen,
+		LastRandom: append([]byte(nil), k.LastRandom...),
+		Hops:       k.Hops,
+	}
+	if k.TransportID != nil {
+		cp.TransportID = append([]byte(nil), k.TransportID...)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.known[hex.EncodeToString(cp.DestHash)] = cp
+}
+
+// KnownSnapshot returns a deep copy of every cached KnownIdentity.
+// Used by the persistence layer to serialize the announce cache on
+// startup or before shutdown without holding the Transport lock during
+// disk I/O.
+func (t *Transport) KnownSnapshot() []*KnownIdentity {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]*KnownIdentity, 0, len(t.known))
+	for _, k := range t.known {
+		cp := *k
+		cp.DestHash = append([]byte(nil), k.DestHash...)
+		cp.PublicKey = append([]byte(nil), k.PublicKey...)
+		cp.NameHash = append([]byte(nil), k.NameHash...)
+		cp.AppData = append([]byte(nil), k.AppData...)
+		cp.LastRandom = append([]byte(nil), k.LastRandom...)
+		if k.TransportID != nil {
+			cp.TransportID = append([]byte(nil), k.TransportID...)
+		}
+		out = append(out, &cp)
+	}
+	return out
 }
 
 // Broadcast sends a packet on every interface. Errors per-interface are
