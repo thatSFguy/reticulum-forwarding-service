@@ -126,6 +126,29 @@ func New(cfg *config.Config) (*Service, error) {
 
 	transport.RegisterAnnounceHandler(&announceTap{svc: svc})
 
+	// Persist the announce cache so a service restart can reach every
+	// previously-known peer immediately, instead of waiting up to one
+	// AnnounceInterval (10 min default) for them to re-announce. The
+	// store is loaded eagerly here; the persist tap runs on every
+	// inbound verified announce thereafter.
+	announceStore := newAnnounceStore(announceStorePath(cfg.Service.StatePath))
+	if entries, dropped, err := announceStore.load(svc.now()); err != nil {
+		logger.Printf("announce cache load: %v (continuing with empty cache)", err)
+	} else {
+		for _, e := range entries {
+			transport.Restore(e)
+		}
+		if len(entries) > 0 || dropped > 0 {
+			logger.Printf("announce cache restored: %d entries (dropped %d stale > %s)",
+				len(entries), dropped, announceStoreMaxAge)
+		}
+	}
+	transport.RegisterAnnounceHandler(&announcePersistTap{
+		transport: transport,
+		store:     announceStore,
+		logger:    logger,
+	})
+
 	return svc, nil
 }
 
