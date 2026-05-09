@@ -1,10 +1,27 @@
 package config
 
 import (
+	"encoding/base64"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+// validServiceConfig is the minimum ServiceConfig that passes normalize();
+// per-test code adds the field under test.
+func validServiceConfig() ServiceConfig {
+	return ServiceConfig{
+		DisplayName:      "x",
+		IdentityPath:     "/tmp/id",
+		StatePath:        "/tmp/st",
+		HistoryPath:      "/tmp/hi",
+		PruneAfter:       Duration(time.Hour),
+		PruneInterval:    Duration(time.Minute),
+		AnnounceInterval: Duration(time.Minute),
+		MaxInboundChars:  500,
+	}
+}
 
 func TestParseDuration(t *testing.T) {
 	cases := []struct {
@@ -99,6 +116,46 @@ func TestNormalizeRejectsBadDurations(t *testing.T) {
 		if err := cfg.normalize(); err == nil {
 			t.Errorf("case %d: expected error", i)
 		}
+	}
+}
+
+func TestIdentityB64ValidatesLength(t *testing.T) {
+	// Valid 64-byte identity → accepted.
+	raw := make([]byte, identityPrivateKeyLen)
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Service.IdentityB64 = base64.StdEncoding.EncodeToString(raw)
+	if err := cfg.normalize(); err != nil {
+		t.Fatalf("normalize with valid identity_b64: %v", err)
+	}
+
+	// Wrong length → rejected with a useful error.
+	cfg2 := &Config{Service: validServiceConfig()}
+	cfg2.Service.IdentityB64 = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	err := cfg2.normalize()
+	if err == nil {
+		t.Fatal("normalize: expected error for 32-byte identity_b64")
+	}
+	if !strings.Contains(err.Error(), "64 bytes") {
+		t.Errorf("error should mention 64 bytes, got: %v", err)
+	}
+
+	// Invalid base64 → rejected.
+	cfg3 := &Config{Service: validServiceConfig()}
+	cfg3.Service.IdentityB64 = "not!valid!base64!"
+	if err := cfg3.normalize(); err == nil {
+		t.Fatal("normalize: expected error for non-base64 identity_b64")
+	}
+}
+
+func TestIdentityB64EmptyIsAllowed(t *testing.T) {
+	// Empty/missing field is the default and must not error — file
+	// path takes over in service.loadOrCreateIdentity.
+	cfg := &Config{Service: validServiceConfig()}
+	if err := cfg.normalize(); err != nil {
+		t.Fatalf("normalize with empty identity_b64: %v", err)
 	}
 }
 

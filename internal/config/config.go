@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -15,6 +16,12 @@ import (
 
 const identityHashLen = 16
 
+// identityPrivateKeyLen is the on-disk Reticulum identity blob: 32-byte
+// X25519 private key concatenated with 32-byte Ed25519 seed (SPEC §1.3).
+// Duplicated here from rns.PrivateKeyLen to keep config validation
+// independent of the rns package import.
+const identityPrivateKeyLen = 64
+
 type Config struct {
 	Service    ServiceConfig     `toml:"service"`
 	Interfaces []InterfaceConfig `toml:"interfaces"`
@@ -24,8 +31,24 @@ type Config struct {
 }
 
 type ServiceConfig struct {
-	DisplayName      string   `toml:"display_name"`
-	IdentityPath     string   `toml:"identity_path"`
+	DisplayName  string `toml:"display_name"`
+	IdentityPath string `toml:"identity_path"`
+
+	// IdentityB64 is an optional base64-encoded backup of the 64-byte
+	// Reticulum private key (X25519 priv 32 || Ed25519 seed 32). When
+	// set, it takes precedence over IdentityPath — the on-disk file is
+	// ignored and not written to. The field exists so an operator can
+	// keep their identity inside the same config they back up before a
+	// reinstall, instead of remembering to also copy the binary
+	// identity file.
+	//
+	// Treat as a SECRET — anyone with this string is your service.
+	// Generated automatically on first run alongside the binary
+	// identity file (see <state_dir>/identity.b64.txt) and logged with
+	// instructions; subsequent runs read the file and leave the config
+	// untouched until the operator chooses to copy the b64 value in.
+	IdentityB64 string `toml:"identity_b64"`
+
 	StatePath        string   `toml:"state_path"`
 	HistoryPath      string   `toml:"history_path"`
 	LogPath          string   `toml:"log_path"`
@@ -158,6 +181,17 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.MaxMembers < 0 {
 		return fmt.Errorf("service.max_members must be >= 0")
+	}
+	if s := strings.TrimSpace(c.Service.IdentityB64); s != "" {
+		raw, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return fmt.Errorf("service.identity_b64: not valid base64: %w", err)
+		}
+		if len(raw) != identityPrivateKeyLen {
+			return fmt.Errorf("service.identity_b64: must decode to %d bytes (got %d)",
+				identityPrivateKeyLen, len(raw))
+		}
+		c.Service.IdentityB64 = s
 	}
 	for i, iface := range c.Interfaces {
 		if iface.Type != "tcp_client" {

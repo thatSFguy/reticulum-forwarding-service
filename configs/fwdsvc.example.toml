@@ -29,6 +29,19 @@ identity_path = "~/.fwdsvc/identity"
 state_path    = "~/.fwdsvc/state.json"
 history_path  = "~/.fwdsvc/history.json"
 
+# Optional: paste the base64 form of your 64-byte identity here to make
+# this config file the single source of truth for your service identity.
+# When set, identity_path is ignored on startup. Useful so a reinstall
+# that only preserves config.toml still keeps the same identity (and
+# therefore the same delivery destination hash everyone in your roster
+# already knows).
+#
+# On first run with no identity, fwdsvc generates one and writes the
+# base64 form to ~/.fwdsvc/identity.b64.txt — copy the contents of that
+# file here to enable backup. Treat as a SECRET; anyone with this string
+# is your service.
+#identity_b64 = "PASTE-BASE64-FROM-identity.b64.txt-HERE"
+
 # Drop a user from the roster if we haven't heard an announce or message from
 # them in this long.
 prune_after = "4w"
