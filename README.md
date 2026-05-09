@@ -381,6 +381,15 @@ LXMF to run a leaf-node group-chat hub. Notable gaps:
   silently reject our outbound LXMF.
 - **No fields** (attachments, stickers, embedded LXMs, telemetry).
   Inbound `fields` parsed and discarded; outbound is always empty.
+- **No voice / audio call support.** fwdsvc is text-only and registers
+  only the `lxmf.delivery` aspect. Voice-capable clients (Sideband,
+  MeshChat) probe a separate `call.audio` destination on the peer
+  identity to set up calls; that destination doesn't exist on us, so
+  the LINKREQUEST goes nowhere. Some clients display this as
+  "codec mismatch" or a brief failed call rather than a clear "not
+  supported" — that's a UX bug upstream, not a fwdsvc gap. Issue
+  draft for [liamcottle/reticulum-meshchat](https://github.com/liamcottle/reticulum-meshchat/issues/new)
+  is in [`docs/meshchat-call-codec-mismatch-issue.md`](docs/meshchat-call-codec-mismatch-issue.md).
 
 ## Verification
 
