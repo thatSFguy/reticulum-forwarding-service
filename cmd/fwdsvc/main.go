@@ -12,11 +12,13 @@ import (
 
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/service"
+	"github.com/thatSFguy/reticulum-forwarding-service/internal/version"
 )
 
-// Version is the human-readable release marker for this build. Bumped
-// per release; printed by --version and emitted in the startup log.
-const Version = "1.2.3"
+// Version is the human-readable release marker for this build. Sourced
+// from internal/version so the /about command and other internals
+// reference the same constant without import cycles.
+const Version = version.Version
 
 func main() {
 	configPath := flag.String("config", "~/.fwdsvc/config.toml", "path to config TOML")
