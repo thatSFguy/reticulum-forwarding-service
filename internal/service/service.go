@@ -6,6 +6,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/commands"
@@ -76,7 +78,7 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 	logger := log.New(logWriter, "fwdsvc ", log.LstdFlags|log.Lmicroseconds)
 
-	id, err := loadOrCreateIdentity(cfg.Service.IdentityPath, logger)
+	id, err := loadOrCreateIdentity(cfg.Service.IdentityB64, cfg.Service.IdentityPath, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -257,21 +259,85 @@ func (s *Service) runPrune(now time.Time) {
 	}
 }
 
-// loadOrCreateIdentity reads an identity from disk, or generates a new
-// one and persists it on first run.
-func loadOrCreateIdentity(path string, logger *log.Logger) (*rns.Identity, error) {
-	if _, err := os.Stat(path); err == nil {
-		return rns.IdentityFromFile(path)
+// loadOrCreateIdentity resolves the service identity from one of three
+// sources, in priority order:
+//
+//  1. service.identity_b64 in the config — base64-encoded backup of the
+//     64-byte raw identity. When set, the on-disk file at identityPath
+//     is ignored and not written to. Lets an operator keep the identity
+//     in the same config file they back up before a reinstall.
+//  2. The binary file at identityPath, if it exists.
+//  3. Generate a fresh identity and save it to identityPath. Also
+//     writes a sibling identity.b64.txt with the base64 form so the
+//     operator can copy the value into service.identity_b64 to make
+//     the config the single backup target. The b64 path is logged
+//     prominently so the recommendation is visible on first run.
+func loadOrCreateIdentity(b64 string, identityPath string, logger *log.Logger) (*rns.Identity, error) {
+	if b64 = strings.TrimSpace(b64); b64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return nil, fmt.Errorf("service.identity_b64: not valid base64: %w", err)
+		}
+		id, err := rns.IdentityFromPrivateKey(raw)
+		if err != nil {
+			return nil, fmt.Errorf("service.identity_b64: %w", err)
+		}
+		logger.Printf("identity loaded from config (identity_b64); ignoring %s", identityPath)
+		return id, nil
+	}
+	if _, err := os.Stat(identityPath); err == nil {
+		return rns.IdentityFromFile(identityPath)
 	}
 	id, err := rns.NewIdentity()
 	if err != nil {
 		return nil, err
 	}
-	if err := id.Save(path); err != nil {
+	if err := id.Save(identityPath); err != nil {
 		return nil, fmt.Errorf("save new identity: %w", err)
 	}
-	logger.Printf("created new identity at %s", path)
+	backupPath := identityPath + ".b64.txt"
+	encoded := base64.StdEncoding.EncodeToString(id.PrivateKey())
+	if err := writeIdentityBackup(backupPath, encoded); err != nil {
+		// Backup file failed to write but the identity is safe on disk
+		// at identityPath. Log loudly and continue — better to keep the
+		// daemon running than to fail startup over a backup-file write.
+		logger.Printf("WARNING: could not write identity backup to %s: %v", backupPath, err)
+		logger.Printf("WARNING: copy the contents of %s manually to back up your identity", identityPath)
+	} else {
+		logger.Printf("created new identity at %s", identityPath)
+		logger.Printf("BACKUP: identity also written to %s as base64", backupPath)
+		logger.Printf("BACKUP: copy that value into your config under [service] identity_b64 = \"...\"")
+		logger.Printf("BACKUP: so the identity survives losing the data dir at %s", filepath.Dir(identityPath))
+	}
 	return id, nil
+}
+
+// writeIdentityBackup writes the base64 form of the identity (with a
+// trailing newline) to path with mode 0600. Atomic via tempfile rename
+// in the same dir so a crash mid-write can't leave a partial file.
+func writeIdentityBackup(path, b64 string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".identity-backup-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.WriteString(b64 + "\n"); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // announceTap updates a roster member's last_announce_at on every announce
