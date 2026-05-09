@@ -174,6 +174,16 @@ display_name = "Group Chat - send /join"
 identity_path = "~/.fwdsvc/identity"
 state_path    = "~/.fwdsvc/state.json"
 history_path  = "~/.fwdsvc/history.json"
+
+# Optional: paste the base64 form of your 64-byte identity here to
+# make this config file the single source of truth for your service
+# identity. When set, identity_path is ignored on startup. Useful so
+# a reinstall that only preserves config.toml still keeps the same
+# identity (and the same delivery destination hash your roster
+# already knows). On first run with no identity, fwdsvc generates one
+# and writes the base64 form to ~/.fwdsvc/identity.b64.txt — copy
+# that file's contents here to enable backup. Treat as a SECRET.
+#identity_b64 = "PASTE-BASE64-FROM-identity.b64.txt-HERE"
 # Optional: append the daemon's stdout log to a file too. Useful for
 # troubleshooting (records every inbound command, every reply, and any
 # truncation events). Empty/unset = stdout only.
@@ -258,14 +268,37 @@ command (avoidable but explicit by design — config edits are auditable).
 
 Default state directory is `~/.fwdsvc/`:
 
-| File             | Purpose                                                          |
-|------------------|------------------------------------------------------------------|
-| `config.toml`    | The config file (you create this).                               |
-| `identity`       | The service's 64-byte Reticulum identity (do not share).         |
-| `state.json`     | Roster + banlist. Atomic writes; safe across crashes.            |
-| `history.json`   | Recent-message ring buffer for replay-on-join.                   |
-| `outbound.json`  | Pending outbound messages — queue with attempt counters and next-attempt timestamps so retries survive restarts. |
-| `announces.json` | Cached `KnownIdentity` per peer (public key + `transport_id` + `last_seen`) so a restart doesn't have to wait for re-announces. Entries older than 30 days are dropped at load. |
+| File                | Purpose                                                          |
+|---------------------|------------------------------------------------------------------|
+| `config.toml`       | The config file (you create this). Can optionally embed the identity via `service.identity_b64` so this single file is enough to restore the service. |
+| `identity`          | The service's 64-byte Reticulum identity (do not share). Ignored on startup if `service.identity_b64` is set in the config. |
+| `identity.b64.txt`  | Auto-written on first-run identity creation — base64 form of `identity` for easy copy into `service.identity_b64`. Same secrecy class as `identity` itself; mode 0600. |
+| `state.json`        | Roster + banlist. Atomic writes; safe across crashes.            |
+| `history.json`      | Recent-message ring buffer for replay-on-join.                   |
+| `outbound.json`     | Pending outbound messages — queue with attempt counters and next-attempt timestamps so retries survive restarts. |
+| `announces.json`    | Cached `KnownIdentity` per peer (public key + `transport_id` + `last_seen`) so a restart doesn't have to wait for re-announces. Entries older than 30 days are dropped at load. |
+
+### Identity backup workflow
+
+If you only back up your `config.toml` between installs (or you redeploy
+to a fresh machine), you'll lose your service's identity unless it lives
+in the config. To make `config.toml` the single backup target:
+
+1. Run `fwdsvc` once — it generates an identity and writes the base64
+   form to `~/.fwdsvc/identity.b64.txt`. The startup log tells you the
+   exact path.
+2. Open that file and copy its contents.
+3. Add to your `config.toml` under `[service]`:
+   ```toml
+   identity_b64 = "<paste here>"
+   ```
+4. Restart `fwdsvc`. The log line will read
+   `identity loaded from config (identity_b64); ignoring …/identity`
+   confirming the config is now authoritative.
+
+After that, your `config.toml` alone is enough to restore the service
+on any machine. The same identity → same destination hash → your
+roster reaches the same place without any user-facing change.
 
 ## Wire-format features implemented
 
