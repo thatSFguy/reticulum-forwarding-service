@@ -11,6 +11,7 @@ import (
 
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/roster"
+	"github.com/thatSFguy/reticulum-forwarding-service/internal/version"
 )
 
 const (
@@ -620,5 +621,36 @@ func TestAnnounceCallsHook(t *testing.T) {
 	}
 	if !called {
 		t.Error("Announce hook was not called")
+	}
+}
+
+// TestAboutCommandReturnsVersionAndRepo pins the /about reply shape:
+// the running Version constant and the canonical RepoURL must both
+// appear so users running an unfamiliar deployment can identify it
+// and find the source. /version is a documented alias.
+func TestAboutCommandReturnsVersionAndRepo(t *testing.T) {
+	d := newDispatcher(t)
+	caller := "0011223344556677" + "8899aabbccddeeff"
+
+	for _, alias := range []string{"/about", "/version"} {
+		out := d.Dispatch(caller, Parse(alias))
+		if !strings.Contains(out, version.Version) {
+			t.Errorf("%s reply missing Version %q: %q", alias, version.Version, out)
+		}
+		if !strings.Contains(out, version.RepoURL) {
+			t.Errorf("%s reply missing RepoURL %q: %q", alias, version.RepoURL, out)
+		}
+	}
+}
+
+// TestAboutTextFitsOpportunisticPacket pins that /about always ships
+// in a single opportunistic packet — like /? it's a fire-and-forget
+// reply with no link-delivery fallback path on small clients.
+func TestAboutTextFitsOpportunisticPacket(t *testing.T) {
+	const maxOpportunisticPayload = 295
+	payload := aboutText()
+	if len(payload) > maxOpportunisticPayload {
+		t.Errorf("aboutText = %d bytes, must be <= %d:\n%s",
+			len(payload), maxOpportunisticPayload, payload)
 	}
 }

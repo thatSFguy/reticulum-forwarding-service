@@ -9,6 +9,7 @@ import (
 
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/roster"
+	"github.com/thatSFguy/reticulum-forwarding-service/internal/version"
 )
 
 // Role of the sender invoking a command. RoleUser is the default —
@@ -73,6 +74,8 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 	switch parsed.Name {
 	case "?", "help":
 		return helpText(caller)
+	case "about", "version":
+		return aboutText()
 	case "users":
 		return d.listUsers()
 	case "mods":
@@ -136,10 +139,18 @@ func (d *Dispatcher) deriveCaller(senderHash string) *Caller {
 // MUST fit in a single opportunistic LXMF packet — the sender of /? has
 // no chunked or link-based reply path. TestHelpTextFitsOpportunisticPacket
 // guards the byte budget across all caller states.
+// aboutText is the /about (and /version alias) reply. Plain
+// version + repo URL, ASCII-only, well under the opportunistic
+// single-packet cap so it always ships fire-and-forget.
+func aboutText() string {
+	return "fwdsvc v" + version.Version + "\nSource: " + version.RepoURL
+}
+
 func helpText(c *Caller) string {
 	var b strings.Builder
 	b.WriteString("Commands:\n")
 	b.WriteString("/?, /help - this list\n")
+	b.WriteString("/about - version + repo\n")
 	b.WriteString("/users /mods /admin - lists\n")
 
 	if !c.Member {
