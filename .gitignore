@@ -1,6 +1,7 @@
 /fwdsvc
 /fwdsvc.exe
 /fwdsvc-*
+/fwdsvc.log
 /build/
 *.test
 *.out

@@ -45,6 +45,13 @@ type Transport struct {
 	// the sweeper don't have to set anything.
 	lifetime *linkLifetime
 
+	// EnableResourceTransfer gates the SPEC §10 Resource transfer path
+	// added in v1.3.0. Default false — v1.2.5 behavior, oversize link
+	// DATA emits as a single packet regardless of MTU. Set true to
+	// route plaintext > LinkMDU via Resource transfer instead. Kept
+	// off by default until the live-receiver Resource bug is fixed.
+	EnableResourceTransfer bool
+
 	logger Logger
 }
 
@@ -840,12 +847,17 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 	link.mu.Unlock()
 
 	// Size-driven dispatch: payloads that don't fit one Link DATA
-	// packet (LinkMDU = 431 bytes plaintext) MUST go via the Resource
-	// transfer protocol, otherwise the resulting >MTU packet gets
-	// dropped at any MTU-enforcing hop and never proofs back. This
-	// is the operator's `/users` failure case before stage-3
-	// stitching landed.
-	if len(plaintext) > LinkMDU {
+	// packet (LinkMDU = 431 bytes plaintext) can route via the
+	// SPEC §10 Resource transfer protocol when EnableResourceTransfer
+	// is set. The Resource path is feature-flagged off by default
+	// because the v1.3.0 implementation has a bug against live
+	// receivers (Sideband / Python LXMF) that we haven't pinned yet.
+	// With it disabled, oversize plaintext takes the v1.2.5 path
+	// below — emit one big link DATA packet and let the interface
+	// either fragment or drop. That's the behavior the 51-user
+	// `/users` reply was succeeding under, so until the Resource
+	// bug is fixed it's the safer default.
+	if t.EnableResourceTransfer && len(plaintext) > LinkMDU {
 		var transportID []byte
 		if known := t.Recall(responderDestHash); known != nil {
 			transportID = known.TransportID
