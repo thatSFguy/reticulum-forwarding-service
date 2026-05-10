@@ -107,6 +107,16 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 	if state != LinkActive {
 		return fmt.Errorf("resource receiver: link state %s, want active", state)
 	}
+
+	// Cap inbound concurrent receivers per link — defends against a
+	// peer that floods us with distinct-hash ADVs, which would
+	// otherwise spawn one receiver goroutine per ADV (each living up
+	// to DefaultLinkSendTimeout=30s before timing out). Counting
+	// happens in the LinkManager registry under its own lock.
+	if existing := t.linkManager.countReceiversForLink(link.ID); existing >= MaxConcurrentInboundResourcesPerLink {
+		return fmt.Errorf("resource receiver: link=%x already has %d inbound resources (cap %d)",
+			link.ID[:4], existing, MaxConcurrentInboundResourcesPerLink)
+	}
 	// Hashmap stored full-size (numParts * MAPHASH_LEN) so HMU
 	// segments can fill in the trailing parts without reallocation.
 	// The known-prefix counter tracks how much is currently valid.

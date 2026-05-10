@@ -154,5 +154,18 @@ func ParseResourceAdv(body []byte) (*ResourceAdvertisement, error) {
 	if adv.NumParts > MaxAcceptedResourceParts {
 		return nil, fmt.Errorf("%w: n=%d cap=%d", ErrResourceTooManyParts, adv.NumParts, MaxAcceptedResourceParts)
 	}
+	// Reject compressed resources. fwdsvc never sends c=1 (we never
+	// produce inbound bodies large enough to benefit from bz2), and
+	// accepting c=1 means inviting bz2 decompression-bomb attacks
+	// per the SPEC §10.4 callout. A 256 KiB encrypted body that bz2-
+	// expands to 100 MiB would OOM the daemon. Rejecting outright is
+	// the most defensive posture; if a real use case for inbound
+	// compressed Resources appears, add bounded
+	// bz2.NewReader(io.LimitReader(...)) decompression in assemble
+	// and verify post-decompress size against MaxDecompressedResourceLen.
+	if adv.Flags&int(ResourceFlagCompressed) != 0 {
+		return nil, fmt.Errorf("%w: compressed (c=1) resources rejected — fwdsvc has no use case + bz2 decompression-bomb risk",
+			ErrResourceTooLarge)
+	}
 	return &adv, nil
 }

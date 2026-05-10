@@ -149,6 +149,14 @@ const (
 	MaxDecompressedResourceLen = MaxAcceptedResourceSize
 )
 
+// MaxConcurrentInboundResourcesPerLink caps how many distinct-hash
+// resources a single link can have in-flight as inbound transfers.
+// A misbehaving peer that sent a flood of distinct-hash ADVs would
+// otherwise spawn one receiver goroutine per ADV (each living up to
+// DefaultLinkSendTimeout = 30s) — a slow leak. Four concurrent inbound
+// transfers per link is more than any legitimate workload needs.
+const MaxConcurrentInboundResourcesPerLink = 4
+
 // HashmapExhaustedFlag values (SPEC §10.5).
 const (
 	HashmapNotExhausted byte = 0x00

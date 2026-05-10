@@ -330,6 +330,23 @@ func (lm *LinkManager) lookupResourceReceiver(linkID, resourceHash []byte) *Reso
 	return lm.receivers[key]
 }
 
+// countReceiversForLink returns the number of inbound resource
+// transfers currently in-flight on link_id. Used by openResourceReceiver
+// to enforce MaxConcurrentInboundResourcesPerLink — defense against
+// a peer flooding us with distinct-hash ADVs.
+func (lm *LinkManager) countReceiversForLink(linkID []byte) int {
+	prefix := hex.EncodeToString(linkID) + ":"
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	n := 0
+	for k := range lm.receivers {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			n++
+		}
+	}
+	return n
+}
+
 // closeResourcesForLink terminates every in-flight transfer
 // associated with link_id. Used by CloseLink to ensure a torn-down
 // link can't leave dangling sender/receiver goroutines.

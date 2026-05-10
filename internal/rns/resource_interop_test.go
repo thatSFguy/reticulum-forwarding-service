@@ -59,17 +59,21 @@ func TestInteropParseUpstreamADV(t *testing.T) {
 	}
 }
 
-func TestInteropParseUpstreamADVCompressed(t *testing.T) {
+func TestInteropParseRejectsCompressed(t *testing.T) {
+	// Stage-6 audit: c=1 (bz2-compressed) ADVs are rejected to
+	// prevent decompression-bomb attacks. fwdsvc has no use case for
+	// compressed inbound resources — every legitimate inbound is an
+	// LXMF DM body well under the per-message limit. If a real need
+	// for compressed inbound appears, replace the reject with bounded
+	// bz2.NewReader(io.LimitReader(...)) decompression in
+	// ResourceReceiver.assemble.
 	body := loadFixture(t, "adv_compressed.bin")
-	adv, err := ParseResourceAdv(body)
-	if err != nil {
-		t.Fatalf("ParseResourceAdv: %v", err)
+	_, err := ParseResourceAdv(body)
+	if err == nil {
+		t.Fatal("expected c=1 ADV to be rejected, got nil error")
 	}
-	if !adv.HasFlag(ResourceFlagCompressed) {
-		t.Errorf("compressed flag not parsed from upstream-encoded ADV")
-	}
-	if !adv.HasFlag(ResourceFlagEncrypted) {
-		t.Errorf("encrypted flag not parsed from upstream-encoded ADV")
+	if !errors.Is(err, ErrResourceTooLarge) {
+		t.Errorf("expected ErrResourceTooLarge wrap, got %v", err)
 	}
 }
 
