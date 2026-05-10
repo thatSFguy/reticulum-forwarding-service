@@ -43,6 +43,13 @@ type ResourceSender struct {
 	advBody         []byte   // pre-packed RESOURCE_ADV msgpack body
 	multihopID      []byte   // transport_id when peer is multi-hop, nil otherwise
 
+	// linkSigning/linkEncryption are snapshotted at construction —
+	// the link's session keys at the moment the resource was built.
+	// Used to encrypt outbound ADV / REQ / HMU / ICL / RCL bodies
+	// (parts and PRF go raw; SPEC §10.3 + upstream Packet.pack).
+	linkSigning    []byte
+	linkEncryption []byte
+
 	// Channels: dispatcher → sender goroutine. Buffered 8 to absorb a
 	// burst without backpressure on the dispatcher; the sender drains
 	// them on every loop iteration.
@@ -178,23 +185,25 @@ func NewResourceSender(t *Transport, link *Link, body []byte, transportID []byte
 	}
 
 	rs := &ResourceSender{
-		transport:     t,
-		link:          link,
-		logger:        logger,
-		resourceHash:  hash,
-		randomR:       randomR,
-		bodyPrefix:    bodyPrefix,
-		expectedProof: expectedProof,
-		originalLen:   len(body),
-		transferLen:   len(wireBlob),
-		parts:         parts,
-		hashmap:       hashmap,
-		advBody:       advBody,
-		multihopID:    transportID,
-		reqCh:         make(chan *ResourceRequest, 8),
-		prfCh:         make(chan *ResourceProof, 1),
-		cancelCh:      make(chan struct{}, 1),
-		done:          make(chan struct{}),
+		transport:        t,
+		link:             link,
+		logger:           logger,
+		resourceHash:     hash,
+		randomR:          randomR,
+		bodyPrefix:       bodyPrefix,
+		expectedProof:    expectedProof,
+		originalLen:      len(body),
+		transferLen:      len(wireBlob),
+		parts:            parts,
+		hashmap:          hashmap,
+		advBody:          advBody,
+		multihopID:       transportID,
+		linkSigning:      signing,
+		linkEncryption:   encryption,
+		reqCh:            make(chan *ResourceRequest, 8),
+		prfCh:            make(chan *ResourceProof, 1),
+		cancelCh:         make(chan struct{}, 1),
+		done:             make(chan struct{}),
 	}
 	rs.state.Store(int32(ResourceStateQueued))
 
@@ -383,10 +392,18 @@ func (rs *ResourceSender) Run(ctx context.Context) error {
 }
 
 // broadcastAdv emits the pre-packed ADV body as a Link DATA packet
-// with context = RESOURCE_ADV. Multi-hop routing is applied per-
-// packet so a re-broadcast after a transit-relay change still routes.
+// with context = RESOURCE_ADV. Body is link-Token-encrypted under the
+// link's session keys (SPEC §10.3 — unlike RESOURCE part packets,
+// ADV is encrypted because it must be confidential against transit
+// relays even though those relays already decrypt the outer Reticulum
+// frame). Multi-hop routing is applied per-packet so a re-broadcast
+// after a transit-relay change still routes correctly.
 func (rs *ResourceSender) broadcastAdv() error {
-	pkt, err := buildResourceCtxPacket(rs.link.ID, rs.advBody, ContextResourceADV, false)
+	ciphertext, err := LinkTokenEncrypt(rs.advBody, rs.linkSigning, rs.linkEncryption)
+	if err != nil {
+		return fmt.Errorf("encrypt ADV: %w", err)
+	}
+	pkt, err := buildResourceCtxPacket(rs.link.ID, ciphertext, ContextResourceADV, false)
 	if err != nil {
 		return fmt.Errorf("build ADV packet: %w", err)
 	}

@@ -471,9 +471,15 @@ func TestSendOverLinkProofTimeout(t *testing.T) {
 	f.cancel()
 	time.Sleep(20 * time.Millisecond) // let dispatcher unwind
 
-	// Send a large message via Delivery.Send. Should time out.
+	// Send a medium-sized message via Delivery.Send. Use 290 bytes to
+	// thread a tight window: msgpack body must exceed the
+	// opportunistic cap (295) so we open a Link, but the LXMF direct
+	// body must stay under Link MDU (~431) so we go single-packet
+	// link DATA rather than Resource. Resource has its own state
+	// machine with different timeout sentinels — out of scope for
+	// this test.
 	f.delA.LinkSendTimeout = 200 * time.Millisecond
-	err = f.delA.Send(f.delB.Hash(), nil, bytes.Repeat([]byte("x"), 600), nil)
+	err = f.delA.Send(f.delB.Hash(), nil, bytes.Repeat([]byte("x"), 290), nil)
 	if err == nil {
 		t.Fatalf("expected proof timeout, got nil")
 	}

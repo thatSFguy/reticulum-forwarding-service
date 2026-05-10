@@ -181,7 +181,13 @@ func TestSenderHappyPath(t *testing.T) {
 	if advPkt.PacketType != PacketData {
 		t.Errorf("ADV packet_type = %d, want PacketData", advPkt.PacketType)
 	}
-	advParsed, err := ParseResourceAdv(advPkt.Data)
+	// ADV body is link-Token-encrypted on the wire — decrypt before
+	// parsing.
+	advPlain, err := LinkTokenDecrypt(advPkt.Data, link.Signing, link.Encryption)
+	if err != nil {
+		t.Fatalf("decrypt ADV: %v", err)
+	}
+	advParsed, err := ParseResourceAdv(advPlain)
 	if err != nil {
 		t.Fatalf("parse ADV body: %v", err)
 	}
@@ -256,7 +262,11 @@ func TestSenderProofMismatchFails(t *testing.T) {
 	}
 	advWire := iface.Snapshot()[0]
 	advPkt, _ := ParsePacket(advWire)
-	advParsed, _ := ParseResourceAdv(advPkt.Data)
+	advPlain, err := LinkTokenDecrypt(advPkt.Data, link.Signing, link.Encryption)
+	if err != nil {
+		t.Fatalf("decrypt ADV: %v", err)
+	}
+	advParsed, _ := ParseResourceAdv(advPlain)
 
 	// Send REQ for all parts, then a BAD proof.
 	requestedMap := [][]byte{}
