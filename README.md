@@ -350,21 +350,26 @@ with a third-party LXMF client.
 The implementation is intentionally minimal — just enough Reticulum +
 LXMF to run a leaf-node group-chat hub. Notable gaps:
 
-- **Forwarder routes opportunistic + Link automatically.** Short
-  messages (≤ ~280 bytes content) ship in a single Token-encrypted
-  Reticulum DATA packet (opportunistic, fire-and-forget). Longer
-  messages fall through to a per-recipient Reticulum Link send: we
-  open the link lazily, send the LXMF body in direct form, and block
-  for the responder's link DATA proof. Idle links auto-close after
-  15 minutes; KEEPALIVE packets fire every 4 minutes to keep busy
-  links alive on the responder side. Multi-hop responders are reached
-  via HEADER_2 LINKREQUEST + transport_id from their announce. Long
-  list replies (e.g. `/users` against a large roster) return the full
-  list — they ride the same opportunistic-or-Link routing as forwarded
-  messages, so size is no longer a constraint. The truncation helper
-  still exists for callers that want a per-command cap (set
-  `Dispatcher.MaxReplyContentBytes`); production wiring leaves it at
-  0 = unlimited.
+- **Forwarder routes opportunistic + Link DATA + Resource transfer
+  automatically.** Three wire paths picked by payload size:
+  - **≤ ~280 bytes content** → single Token-encrypted Reticulum DATA
+    packet (opportunistic, fire-and-forget).
+  - **content fits one Link DATA packet (LXMF direct body ≤ 431
+    bytes plaintext)** → per-recipient Reticulum Link, single Token-
+    framed packet, blocking on the responder's link DATA proof.
+  - **larger** → SPEC §10 Resource transfer over the same Link:
+    sender link-encrypts the whole body, slices into raw-ciphertext
+    parts, advertises via msgpack ADV, fulfills receiver-driven REQs,
+    validates the receiver's RESOURCE_PRF in constant time. fwdsvc
+    can both send and receive resources up to 256 KiB / 74 parts;
+    inbound `c=1` (bz2-compressed) and `n>74` ADVs are rejected
+    (bomb defense, see `docs/resource-security-audit.md`). This was
+    added in v1.3.0 — prior versions had `/users` replies silently
+    fail on any path with an MTU-enforcing hop.
+  Idle links auto-close after 15 minutes; KEEPALIVE every 4 minutes.
+  Multi-hop responders reached via HEADER_2 LINKREQUEST + transport_id.
+  Long list replies (e.g. `/users` against a large roster) return the
+  full list — size is no longer a delivery constraint.
 - **Single TCP interface type** — `tcp_client` only. No LoRa /
   RNode-serial, no UDP, no AutoInterface (LAN multicast), no I2P. A
   Pi with a real LoRa modem will need to run upstream `rnsd`

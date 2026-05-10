@@ -420,6 +420,15 @@ func (t *Transport) dispatch(raw []byte) {
 			t.handleLRProof(p)
 			return
 		}
+		if p.DestinationType == DestinationLink && p.Context == ContextResourcePRF {
+			// RESOURCE_PRF — the receiver's final proof for one of our
+			// outbound resources. Routed to the matching ResourceSender
+			// by (link_id, resource_hash); a PRF for an unknown sender
+			// is dropped silently (e.g. duplicate after we already
+			// completed and unregistered).
+			t.handleResourceProof(p)
+			return
+		}
 		if p.DestinationType == DestinationLink && p.Context == ContextNone {
 			// Explicit-form link DATA proof acknowledging an outbound
 			// link DATA we sent as initiator. Validates the signature
@@ -694,8 +703,29 @@ func (t *Transport) handleLinkData(p *Packet) {
 		}
 		return
 	}
-	if p.Context != ContextNone {
-		// Link DATA on other contexts (resource transfer etc.) — out of scope.
+	switch p.Context {
+	case ContextNone:
+		// Fall through to the original direct-LXMF handler below.
+	case ContextResourceADV, ContextResourceREQ, ContextResourceHMU,
+		ContextResourceICL, ContextResourceRCL:
+		// Resource control packets — bodies are link-encrypted (SPEC
+		// §10.3 + upstream Packet.pack:212-215). Decrypt, then dispatch
+		// by context. Resource part packets (ContextResource) are NOT
+		// encrypted (raw slice of pre-encrypted blob) so they have
+		// their own branch below.
+		t.handleResourceControl(p)
+		return
+	case ContextResource:
+		// RESOURCE part — body is a raw ciphertext slice, no per-
+		// packet decrypt. The part doesn't carry resource_hash
+		// in-band; we walk active receivers on this link and route
+		// to whichever one has a matching map_hash slot. fwdsvc
+		// usually has at most one inbound resource per link in
+		// flight, so the walk is short.
+		t.handleResourcePart(p)
+		return
+	default:
+		// Other contexts (REQUEST/RESPONSE/etc) — out of scope for fwdsvc.
 		return
 	}
 
@@ -808,6 +838,22 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 	encryption := append([]byte(nil), link.Encryption...)
 	linkID := append([]byte(nil), link.ID...)
 	link.mu.Unlock()
+
+	// Size-driven dispatch: payloads that don't fit one Link DATA
+	// packet (LinkMDU = 431 bytes plaintext) MUST go via the Resource
+	// transfer protocol, otherwise the resulting >MTU packet gets
+	// dropped at any MTU-enforcing hop and never proofs back. This
+	// is the operator's `/users` failure case before stage-3
+	// stitching landed.
+	if len(plaintext) > LinkMDU {
+		var transportID []byte
+		if known := t.Recall(responderDestHash); known != nil {
+			transportID = known.TransportID
+		}
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		return t.SendResourceOverLink(ctx, link, plaintext, transportID)
+	}
 
 	dataPkt, err := BuildLinkDataPacket(linkID, signing, encryption, plaintext)
 	if err != nil {
