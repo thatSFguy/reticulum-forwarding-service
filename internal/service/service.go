@@ -421,6 +421,35 @@ func (t *announceTap) OnAnnounce(a *rns.Announce) {
 	if err := t.svc.roster.UpdateLastAnnounce(a.DestHash, t.svc.now()); err != nil {
 		t.svc.logger.Printf("announce update: %v", err)
 	}
+	t.maybeAdoptAnnouncedNickname(a)
+}
+
+// maybeAdoptAnnouncedNickname pulls the announced display name into the
+// roster as a nickname iff the user is a member with no nickname set.
+// Mirrors the /join-time default but applies it on every subsequent
+// announce too, so a member who joined before their first announce was
+// heard (or whose nickname was cleared) will pick up their display name
+// the next time they announce. A user who already has a nickname keeps
+// it — /nick is authoritative; announce-derived names never overwrite.
+func (t *announceTap) maybeAdoptAnnouncedNickname(a *rns.Announce) {
+	hashHex := hex.EncodeToString(a.DestHash)
+	u, ok := t.svc.roster.Get(hashHex)
+	if !ok || u.Nickname != "" {
+		return
+	}
+	name, err := rns.DecodeLXMFAppDataDisplayName(a.AppData)
+	if err != nil || len(name) == 0 {
+		return
+	}
+	sanitized := commands.SanitizeNickname(string(name))
+	if sanitized == "" {
+		return
+	}
+	if err := t.svc.roster.SetNickname(hashHex, sanitized); err != nil {
+		t.svc.logger.Printf("nick from announce: set %s for %s: %v", sanitized, hashHex[:8], err)
+		return
+	}
+	t.svc.logger.Printf("nick from announce: adopted %q for %s", sanitized, hashHex[:8])
 }
 
 // openLogWriter returns an io.Writer for the daemon logger. Stdout is

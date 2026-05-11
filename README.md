@@ -81,6 +81,15 @@ Reticulum-supported transport.
   is **not** forwarded and the sender is **not** added to the roster
   until they explicitly send `/join`. Avoids the "I sent one test
   message and now strangers are getting it" UX.
+- **Default nickname from announces.** A member with no nickname set
+  picks one up automatically from their LXMF announce's display name,
+  sanitised into the `[A-Za-z0-9_-]{1,24}` alphabet (`"Bob & Alice"`
+  → `"Bob_Alice"`, all-emoji collapses to empty and stays unset).
+  Applied at `/join` time and on every subsequent announce until a
+  nickname is set, so a user who joined before their first announce
+  arrived still gets named once it does. `/nick` is authoritative —
+  once a user (or a mod) sets a nickname, announces never overwrite
+  it.
 - **Replay on join.** New (and returning) members receive the most
   recent buffered messages so they can pick up the conversation.
   Defaults: last 100 messages, nothing older than 7 days. Configurable.
