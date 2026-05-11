@@ -574,9 +574,7 @@ func (t *Transport) handleLinkRequest(p *Packet) {
 	link.mu.Unlock()
 
 	t.logger.Printf("link established (responder): id=%x peer LRREQ from %x", link.ID[:4], p.DestHash[:4])
-	if err := t.Broadcast(lrProof); err != nil {
-		t.logger.Printf("broadcast LRPROOF: %v", err)
-	}
+	t.broadcastWithRetransmits(lrProof, "LRPROOF")
 }
 
 // pathRequestWellKnownHash is the 16-byte well-known PLAIN destination
@@ -647,9 +645,7 @@ func (t *Transport) handlePathRequest(p *Packet) {
 		return
 	}
 	t.logger.Printf("path? answered for %x (tag %x)", target[:4], tag[:4])
-	if err := t.Broadcast(pkt); err != nil {
-		t.logger.Printf("broadcast path-response: %v", err)
-	}
+	t.broadcastWithRetransmits(pkt, "path-response announce")
 }
 
 // handleLRProof feeds an inbound LRPROOF (responder -> initiator) to the
@@ -812,9 +808,38 @@ func (t *Transport) handleLinkData(p *Packet) {
 		t.logger.Printf("build link proof: %v", err)
 		return
 	}
-	if err := t.Broadcast(proof); err != nil {
-		t.logger.Printf("broadcast link proof: %v", err)
+	t.broadcastWithRetransmits(proof, "link DATA PROOF")
+}
+
+// broadcastWithRetransmits emits a packet immediately and re-emits it 2
+// more times with growing delays (~250ms and ~1s after the initial).
+// Defends against single-packet loss on multi-hop relay paths where
+// LRPROOF or link DATA PROOF dropping forces the peer into a 30s+
+// link-establishment retry. Duplicates are harmless: receivers dedup
+// via packet_hashlist (RNS/Transport.py:1317-1325) so the 2nd and 3rd
+// copies are silently filtered.
+//
+// Cost is bounded — at most 3 packets per inbound LRREQ or link DATA,
+// firing on the same-process dispatcher's response path. The
+// retransmit goroutine exits within ~1s; concurrent retransmits across
+// many simultaneous links are independent and lightweight.
+//
+// `label` is just for the diagnostic log line on broadcast failure.
+func (t *Transport) broadcastWithRetransmits(pkt *Packet, label string) {
+	if err := t.Broadcast(pkt); err != nil {
+		t.logger.Printf("broadcast %s: %v", label, err)
+		return
 	}
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		if err := t.Broadcast(pkt); err != nil {
+			t.logger.Printf("retransmit %s (1/2): %v", label, err)
+		}
+		time.Sleep(750 * time.Millisecond)
+		if err := t.Broadcast(pkt); err != nil {
+			t.logger.Printf("retransmit %s (2/2): %v", label, err)
+		}
+	}()
 }
 
 // Sentinel errors returned by SendOverLink so callers can branch on
@@ -889,7 +914,19 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 		}
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
-		return t.SendResourceOverLink(ctx, link, plaintext, transportID)
+		err := t.SendResourceOverLink(ctx, link, plaintext, transportID)
+		// On timeout, tear down the cached link. A timeout almost always
+		// means the responder no longer knows this link_id (peer
+		// restarted, link expired on their side, or kept-alive missed).
+		// Without explicit teardown we'd reuse the stale link on every
+		// outbound-queue retry, hitting the same silent-drop on the
+		// peer's side and burning the entire retry budget. Closing
+		// forces acquireLinkTo to handshake fresh on the next attempt.
+		if err != nil && (errors.Is(err, ErrResourceTimeout) || errors.Is(err, context.DeadlineExceeded)) {
+			t.linkManager.CloseLink(link.ID)
+			t.logger.Printf("torn down stale outbound link %x after Resource timeout", link.ID[:4])
+		}
+		return err
 	}
 
 	dataPkt, err := BuildLinkDataPacket(linkID, signing, encryption, plaintext)
@@ -939,6 +976,11 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 	case proofErr := <-waiter:
 		return proofErr
 	case <-timer.C:
+		// Same staleness logic as the Resource path above: tear down
+		// the cached link so the next retry handshakes fresh instead of
+		// burning more attempts on a link the peer no longer knows.
+		t.linkManager.CloseLink(link.ID)
+		t.logger.Printf("torn down stale outbound link %x after DATA proof timeout", link.ID[:4])
 		return ErrLinkProofTimeout
 	}
 }
@@ -1204,6 +1246,14 @@ func (t *Transport) sweepLinks() {
 
 // AnnouncePeriodically re-broadcasts the announce returned by build() on
 // every tick. Returns when ctx is cancelled.
+//
+// On startup it also issues a "burst": announces at t=0, t=5s, and
+// t=30s so any peer that connects to the same transport node within
+// the first half-minute receives our announce promptly. Without this
+// burst, a leaf peer that joins right after fwdsvc starts has to wait
+// until fwdsvc's NEXT periodic tick (up to interval) before it sees a
+// fresh announce — which on multi-hop paths typically translates to
+// 30+ s of LRREQ-times-out-and-retries before path discovery converges.
 func (t *Transport) AnnouncePeriodically(ctx context.Context, interval time.Duration, build func() (*Packet, error)) {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
@@ -1217,7 +1267,23 @@ func (t *Transport) AnnouncePeriodically(ctx context.Context, interval time.Dura
 			t.logger.Printf("announce broadcast: %v", err)
 		}
 	}
-	emit() // immediate
+	// Startup burst: 0s, 5s, 30s. Keeps fresh-connect peers from
+	// waiting up to a full `interval` for path discovery to converge.
+	emit()
+	go func() {
+		select {
+		case <-time.After(5 * time.Second):
+			emit()
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-time.After(25 * time.Second):
+			emit()
+		case <-ctx.Done():
+			return
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
