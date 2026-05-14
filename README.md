@@ -522,6 +522,41 @@ to the microsecond. Examples worth recognising:
 | `tcp interface … disconnected: … — reconnecting` | Upstream TCP drop; supervisor will redial with backoff (v1.3.6+). |
 | `tcp interface … reconnected`               | Reconnect succeeded; interface is live again (v1.3.6+). |
 
+### Scaling and resource use
+
+A few load-related facts worth knowing before you grow the roster past
+a few dozen — none are currently a problem at typical sizes but they
+shape what you'd notice first if you pushed harder:
+
+- **Outbound queue depth scales linearly with active roster.** Each
+  inbound chat message produces one `outbound.json` entry per active
+  (non-paused) recipient. A 60-member roster + one message in flight =
+  up to ~59 pending entries. They drain promptly when recipients are
+  reachable; an unreachable recipient stays queued for up to
+  `5 × 10s ≈ 50s` before the queue gives up.
+- **Drain concurrency is fixed at 4 workers**, not scaled with roster
+  size (`outboundWorkers` constant in `internal/service/outbound.go`).
+  Four is enough that a slow send to one recipient doesn't head-of-line
+  block the others. For very large rosters (hundreds of members) on a
+  fast interface, raising the constant and rebuilding would speed up
+  fan-out.
+- **No upper bound on pending depth.** Nothing rejects new messages
+  when the queue is long. In steady state the queue is bounded by chat
+  cadence × the per-recipient retry window, not by anything explicit.
+  Worth knowing if you ever script a flood through the relay.
+- **`outbound.json` is rewritten on every `Enqueue`** — fanning out
+  one message to N recipients does N full-file writes, each marshaling
+  up to N entries (O(N²) in disk write volume per fan-out). Negligible
+  at current sizes; the first thing that would need a batched-persist
+  refactor if the roster grew toward several hundred.
+- **Attachments are not persisted.** Per-message LXMF fields (e.g. a
+  forwarded `FIELD_IMAGE`) live in memory only — a crash between
+  enqueue and send drops the image but keeps the text body, which
+  re-sends on restart. Acceptable degradation; sender can always
+  resend.
+- **History buffer is bounded** by `replay.count` (default 100). Older
+  forwarded lines roll off when a new one is appended.
+
 ### Troubleshooting
 
 **My users never see replies to `/users` (or other commands).** A
@@ -645,8 +680,11 @@ LXMF to run a group-chat hub. Notable gaps:
   are decryptable.
 - **No stamps / proof-of-work anti-spam.** Peers that *require*
   stamps will silently reject our outbound LXMF.
-- **No fields** (attachments, stickers, embedded LXMs, telemetry).
-  Inbound `fields` are parsed and discarded; outbound is always empty.
+- **Limited LXMF field support.** `FIELD_IMAGE` (key 6) is forwarded
+  through group chat by default (v1.4.0+); `FIELD_FILE_ATTACHMENTS`
+  (5) and `FIELD_AUDIO` (7) can be enabled per-operator via
+  `forwarded_fields`. Stickers, embedded LXMs, telemetry,
+  icon-appearance, and command fields are still parsed but discarded.
 - **No voice / audio.** Text-only. We register only the
   `lxmf.delivery` aspect — never `call.audio`. Some MeshChat users
   see a brief "incoming call" notification attributed to `fwdsvc`
