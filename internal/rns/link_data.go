@@ -223,12 +223,13 @@ func BuildLinkRTT(linkID, signing, encryption []byte, rttSeconds float64) (*Pack
 // therefore which destination) it's driving the link from. Plaintext
 // before link-DATA encryption is:
 //
-//	identity_hash(16) || ed25519_signature(64)
+//	public_key(64) || ed25519_signature(64)
 //
-// where the signature covers (link_id(16) || identity.public_key(64)).
-// The responder verifies the signature against the identity's known
-// Ed25519 public key (looked up from the announce table by
-// identity_hash) and caches the identity (and the matching destination)
+// matching upstream RNS `Link.identify()` (RNS/Link.py: proof_data =
+// identity.get_public_key() + signature). The signature covers
+// (link_id(16) || public_key(64)). The responder verifies it against
+// the public key carried in the payload itself — no announce lookup
+// needed — and caches the identity (and the matching destination)
 // on the session, so asynchronous follow-up traffic — most importantly
 // tap-back reactions on a relayed group bubble — gets routed back
 // through the initiator's destination rather than to some peer hash
@@ -252,8 +253,8 @@ func BuildLinkIdentify(linkID []byte, signing, encryption []byte, id *Identity) 
 		return nil, fmt.Errorf("identity sign returned %d bytes, want %d", len(sig), ed25519.SignatureSize)
 	}
 
-	plaintext := make([]byte, 0, IdentityHashLen+len(sig))
-	plaintext = append(plaintext, id.Hash()...)
+	plaintext := make([]byte, 0, len(pubkey)+len(sig))
+	plaintext = append(plaintext, pubkey...)
 	plaintext = append(plaintext, sig...)
 
 	ciphertext, err := LinkTokenEncrypt(plaintext, signing, encryption)

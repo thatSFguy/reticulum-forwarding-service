@@ -8,9 +8,10 @@ import (
 
 // TestBuildLinkIdentifyHappyPath builds a LINKIDENTIFY packet for a
 // known link, decrypts the body with the same session keys (as the
-// responder would), and verifies the wire shape SPEC §6.6 expects:
-// identity_hash(16) || ed25519_signature(64) where the signature
-// covers link_id(16) || identity.public_key(64).
+// responder would), and verifies the wire shape upstream RNS expects
+// (RNS/Link.py — proof_data = identity.get_public_key() + signature):
+// public_key(64) || ed25519_signature(64), the signature covering
+// link_id(16) || public_key(64).
 func TestBuildLinkIdentifyHappyPath(t *testing.T) {
 	id, err := NewIdentity()
 	if err != nil {
@@ -42,21 +43,22 @@ func TestBuildLinkIdentifyHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LinkTokenDecrypt: %v", err)
 	}
-	if len(plaintext) != IdentityHashLen+ed25519.SignatureSize {
-		t.Fatalf("plaintext = %d bytes, want %d", len(plaintext),
-			IdentityHashLen+ed25519.SignatureSize)
+	pubLen := len(id.PublicKey()) // 64 — X25519(32) || Ed25519(32)
+	if len(plaintext) != pubLen+ed25519.SignatureSize {
+		t.Fatalf("plaintext = %d bytes, want %d (public_key || signature)",
+			len(plaintext), pubLen+ed25519.SignatureSize)
 	}
-	gotHash := plaintext[:IdentityHashLen]
-	gotSig := plaintext[IdentityHashLen:]
+	gotPub := plaintext[:pubLen]
+	gotSig := plaintext[pubLen:]
 
-	if !bytes.Equal(gotHash, id.Hash()) {
-		t.Errorf("identity_hash mismatch: got %x, want %x", gotHash, id.Hash())
+	if !bytes.Equal(gotPub, id.PublicKey()) {
+		t.Errorf("public_key mismatch: got %x, want %x", gotPub, id.PublicKey())
 	}
 
 	signedData := append(append([]byte{}, linkID...), id.PublicKey()...)
 	edPub := id.PublicKey()[32:]
 	if !ed25519.Verify(ed25519.PublicKey(edPub), signedData, gotSig) {
-		t.Error("signature did not verify against link_id || pubkey")
+		t.Error("signature did not verify against link_id || public_key")
 	}
 }
 
