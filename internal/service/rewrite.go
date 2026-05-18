@@ -16,6 +16,43 @@ const reactionField = 16
 // just UTF-8 text and passes through verbatim.
 const replyHashField = 48
 
+// replyTextField is LXMF field key 0x31 = 49 — the optional quoted-
+// content preview accompanying a reply. Named here so bubble
+// classification can recognise (and exclude) a bare reply-to message.
+const replyTextField = 49
+
+// isPrimaryBubble reports whether a forwarded message is a standalone,
+// reactable bubble as opposed to a reaction or a bare reply-to that
+// merely annotates an existing bubble. Only primary bubbles get a new
+// idmap cache entry, so later reactions can be rewritten to bind to
+// them.
+//
+// A message is primary when it has visible text content OR carries any
+// field that is not itself a reaction/reply marker — i.e. an
+// attachment such as FIELD_IMAGE. An image message arrives with
+// content=="" but IS a reactable bubble; the original `content != ""`
+// check missed it, so reactions to forwarded images never bound.
+func isPrimaryBubble(content string, fields map[any]any) bool {
+	if content != "" {
+		return true
+	}
+	for k := range fields {
+		ki, ok := keyAsInt(k)
+		if !ok {
+			continue
+		}
+		switch ki {
+		case reactionField, replyHashField, replyTextField:
+			continue
+		default:
+			// An attachment field (image/audio/file, …) — this message
+			// is a bubble in its own right.
+			return true
+		}
+	}
+	return false
+}
+
 // buildRewrite returns a per-recipient field rewrite closure suitable
 // for forwardOpts.rewrite, or nil if this inbound message has no
 // reaction_to / reply-to fields that need substituting.

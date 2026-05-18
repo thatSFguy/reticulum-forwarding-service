@@ -146,11 +146,13 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// passthrough (which won't bind — see Limitations in README).
 	opts := forwardOpts{rewrite: s.buildRewrite(fwdFields)}
 
-	// Only register a new bubble for primary text bubbles. Reactions
-	// and bare replies don't get reacted-to in practice, and keeping
-	// them out of the cache prevents reaction-of-reaction chains from
-	// thrashing the table.
-	if content != "" {
+	// Register a new bubble for primary, reactable bubbles — text
+	// messages AND image/attachment messages (which arrive with
+	// content=="" but ARE reacted to). Reactions and bare replies are
+	// excluded: they annotate an existing bubble rather than being one,
+	// and keeping them out of the cache prevents reaction-of-reaction
+	// chains from thrashing the table.
+	if isPrimaryBubble(content, fwdFields) {
 		opts.bubble = s.newBubbleForForward()
 		// Pre-register the original sender's view of THIS message — fwdsvc
 		// already knows it (= msg.MessageID(), the same value the sender
