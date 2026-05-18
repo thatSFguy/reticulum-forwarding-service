@@ -250,8 +250,19 @@ func TestBuildLinkKeepalive(t *testing.T) {
 	if !bytes.Equal(pkt.DestHash, linkID) {
 		t.Error("dest_hash should be link_id")
 	}
-	if len(pkt.Data) != 1 || pkt.Data[0] != 0 {
-		t.Errorf("KEEPALIVE body = %x, want [0x00]", pkt.Data)
+	if len(pkt.Data) != 1 || pkt.Data[0] != 0xFF {
+		t.Errorf("KEEPALIVE ping body = %x, want [0xFF]", pkt.Data)
+	}
+
+	pong, err := BuildLinkKeepalivePong(linkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pong.Context != ContextKeepalive {
+		t.Errorf("pong context = 0x%02x, want 0x%02x", pong.Context, ContextKeepalive)
+	}
+	if len(pong.Data) != 1 || pong.Data[0] != 0xFE {
+		t.Errorf("KEEPALIVE pong body = %x, want [0xFE]", pong.Data)
 	}
 }
 

@@ -165,11 +165,33 @@ const ContextKeepalive = 0xFA
 // RNS/Link.py:440-442 (initiator send) + 534-553 (responder activate).
 const ContextLRRTT = 0xFE
 
-// BuildLinkKeepalive builds a small DATA packet with context=KEEPALIVE
-// addressed to the link, used to refresh the activity timer at both
-// ends. Body is a single 0x00 byte (matches upstream RNS, which sends
-// `bytes([0x00])` as the keepalive payload).
+// Keepalive sentinel bytes. The link initiator periodically sends a
+// ping (0xFF); the responder answers every ping with a pong (0xFE) so
+// the initiator's activity timer is refreshed on an otherwise-idle
+// link. Verbatim from upstream RNS: send_keepalive emits bytes([0xFF])
+// (RNS/Link.py:849) and the responder replies bytes([0xFE]) on an
+// inbound 0xFF (RNS/Link.py:1150-1151). KEEPALIVE packets are NOT
+// encrypted — the body is the single sentinel byte on the wire
+// (RNS/Packet.py:206-209).
+const (
+	keepalivePing byte = 0xFF
+	keepalivePong byte = 0xFE
+)
+
+// BuildLinkKeepalive builds the DATA/KEEPALIVE ping packet the link
+// initiator sends to refresh the activity timer on an idle link.
 func BuildLinkKeepalive(linkID []byte) (*Packet, error) {
+	return buildKeepalivePacket(linkID, keepalivePing)
+}
+
+// BuildLinkKeepalivePong builds the DATA/KEEPALIVE pong (0xFE) a link
+// responder sends in reply to an inbound ping, so the initiator's
+// keepalive timer is satisfied and it doesn't mark the link stale.
+func BuildLinkKeepalivePong(linkID []byte) (*Packet, error) {
+	return buildKeepalivePacket(linkID, keepalivePong)
+}
+
+func buildKeepalivePacket(linkID []byte, sentinel byte) (*Packet, error) {
 	if len(linkID) != IdentityHashLen {
 		return nil, fmt.Errorf("link_id must be %d bytes", IdentityHashLen)
 	}
@@ -182,7 +204,7 @@ func BuildLinkKeepalive(linkID []byte) (*Packet, error) {
 		Hops:            0,
 		DestHash:        linkID,
 		Context:         ContextKeepalive,
-		Data:            []byte{0x00},
+		Data:            []byte{sentinel},
 	}, nil
 }
 

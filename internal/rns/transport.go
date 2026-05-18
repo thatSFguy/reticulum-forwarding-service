@@ -616,11 +616,16 @@ func (t *Transport) handlePathRequest(p *Packet) {
 	if err != nil {
 		return
 	}
-	// Tag is the 16 bytes after target_dest_hash.
+	// The tag is the TRAILING 16 bytes of the request body. SPEC §7.2.1
+	// has two forms: the leaf form `target(16) || tag(16)` (32 B) and
+	// the transport-originator form `target(16) || transport_id(16) ||
+	// tag(16)` (48 B). Slicing a fixed [16:32] would mistake the
+	// transport_id for the tag on the 48-byte form and dedup on the
+	// wrong bytes — take the last 16 instead.
 	if len(p.Data) < IdentityHashLen*2 {
-		return // no tag, malformed leaf-form request
+		return // no tag, malformed request
 	}
-	tag := p.Data[IdentityHashLen : IdentityHashLen*2]
+	tag := p.Data[len(p.Data)-IdentityHashLen:]
 	tagKey := hex.EncodeToString(tag)
 
 	t.mu.Lock()
@@ -786,11 +791,29 @@ func (t *Transport) sendLRRTT(linkID []byte, link *Link, rttSec float64) error {
 // OnInboundData callback (if set).
 func (t *Transport) handleLinkData(p *Packet) {
 	if p.Context == ContextKeepalive {
-		// Just bump activity. SPEC: KEEPALIVE has body [0x00].
-		if l := t.linkManager.Get(p.DestHash); l != nil {
-			l.mu.Lock()
-			l.LastActivity = time.Now()
-			l.mu.Unlock()
+		l := t.linkManager.Get(p.DestHash)
+		if l == nil {
+			return
+		}
+		l.mu.Lock()
+		l.LastActivity = time.Now()
+		isResponder := l.responderIdentity != nil
+		l.mu.Unlock()
+		// The link responder answers every inbound ping (0xFF) with a
+		// pong (0xFE) so the initiator's keepalive timer is refreshed
+		// on an otherwise-idle link (RNS/Link.py:1150-1151). Without
+		// this, an upstream RNS initiator sees no inbound traffic,
+		// marks the link STALE after 2×keepalive, and tears it down.
+		// The pong stays HEADER_1 — link packets route by link_table.
+		if isResponder && len(p.Data) == 1 && p.Data[0] == keepalivePing {
+			pong, err := BuildLinkKeepalivePong(l.ID)
+			if err != nil {
+				t.logger.Printf("build keepalive pong: %v", err)
+				return
+			}
+			if err := t.Broadcast(pong); err != nil {
+				t.logger.Printf("keepalive pong broadcast: %v", err)
+			}
 		}
 		return
 	}
@@ -1278,15 +1301,12 @@ func (t *Transport) sweepLinks() {
 				t.logger.Printf("link sweep: build keepalive: %v", err)
 				continue
 			}
-			// Re-route via HEADER_2 if the peer is multi-hop.
-			if l := t.linkManager.Get(a.linkID); l != nil {
-				peer := l.PeerDestHash()
-				if peer != nil {
-					if known := t.Recall(peer); known != nil {
-						applyMultihopRouting(pkt, known.TransportID)
-					}
-				}
-			}
+			// KEEPALIVE stays HEADER_1 even for a multi-hop peer: link
+			// packets are routed by the relay link_table and forwarded
+			// verbatim. Setting a transport_id (HEADER_2) makes the
+			// destination's packet filter drop the keepalive as "for
+			// another transport instance" (SPEC §6.4.3) — so the link
+			// would silently go stale on any multi-hop path.
 			if err := t.Broadcast(pkt); err != nil {
 				t.logger.Printf("link sweep: broadcast keepalive: %v", err)
 				continue
