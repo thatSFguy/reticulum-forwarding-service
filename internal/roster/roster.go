@@ -28,6 +28,14 @@ type User struct {
 	// metered cellular) who want to stay in the conversation without
 	// paying for every photo. Toggled via /textonly and /showall.
 	TextOnly bool `json:"text_only,omitempty"`
+
+	// Role is the runtime-granted privilege level: "" (regular user),
+	// "mod", or "admin". Set via /usermode and persisted here. It is a
+	// floor-raiser, not the source of truth: the effective role is the
+	// max of this and the config admins/mods lists, so a config-granted
+	// role can never be demoted from within the chat (edit the config
+	// for that). Empty for the overwhelming majority of users.
+	Role string `json:"role,omitempty"`
 }
 
 // LastSeen reports the most recent moment we have evidence the user was
@@ -223,6 +231,26 @@ func (r *Roster) SetTextOnly(hashHex string, textOnly bool) error {
 		return fmt.Errorf("user not in roster")
 	}
 	u.TextOnly = textOnly
+	return r.persistLocked()
+}
+
+// SetRole sets (or, with role=="", clears) the user's runtime-granted
+// role. Returns an error if the user isn't in the roster. Accepts only
+// "", "mod", or "admin"; any other value is rejected. See User.Role for
+// the floor semantics — this never lowers a config-granted role.
+func (r *Roster) SetRole(hashHex, role string) error {
+	switch role {
+	case "", "mod", "admin":
+	default:
+		return fmt.Errorf("invalid role %q", role)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[strings.ToLower(hashHex)]
+	if !ok {
+		return fmt.Errorf("user not in roster")
+	}
+	u.Role = role
 	return r.persistLocked()
 }
 
