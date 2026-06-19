@@ -127,6 +127,8 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return d.handleShowAll(caller)
 	case "nick":
 		return d.handleNick(caller, parsed.Args)
+	case "usermode":
+		return d.handleUserMode(caller, parsed.Args)
 	case "kick":
 		return d.handleKick(caller.Role, parsed.Args)
 	case "ban":
@@ -151,14 +153,7 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 func (d *Dispatcher) deriveCaller(senderHash string) *Caller {
 	sh := strings.ToLower(senderHash)
 	c := &Caller{Hash: sh, HashBytes: mustHexBytes(sh)}
-	switch {
-	case d.Cfg.IsAdmin(sh):
-		c.Role = RoleAdmin
-	case d.Cfg.IsMod(sh):
-		c.Role = RoleMod
-	default:
-		c.Role = RoleUser
-	}
+	c.Role = d.configRole(sh)
 	if c.HashBytes != nil {
 		c.Member = d.Roster.Has(c.HashBytes)
 	}
@@ -166,9 +161,54 @@ func (d *Dispatcher) deriveCaller(senderHash string) *Caller {
 		if u, ok := d.Roster.Get(sh); ok {
 			c.Paused = u.Paused
 			c.TextOnly = u.TextOnly
+			// The runtime-granted role can only RAISE the config floor,
+			// never lower it — so a config admin/mod keeps their powers
+			// even if the roster role is empty or lower. See User.Role.
+			if rr := parseRole(u.Role); rr > c.Role {
+				c.Role = rr
+			}
 		}
 	}
 	return c
+}
+
+// parseRole maps a persisted roster role string to a Role. Unknown or
+// empty strings collapse to RoleUser.
+func parseRole(s string) Role {
+	switch s {
+	case "admin":
+		return RoleAdmin
+	case "mod":
+		return RoleMod
+	default:
+		return RoleUser
+	}
+}
+
+// roleName is the human-facing label for a Role, used in /usermode
+// replies. Inverse of parseRole for the non-user roles.
+func roleName(r Role) string {
+	switch r {
+	case RoleAdmin:
+		return "admin"
+	case RoleMod:
+		return "mod"
+	default:
+		return "user"
+	}
+}
+
+// configRole returns the role granted to a hash purely by the config
+// admins/mods lists — the immutable floor that /usermode can't lower.
+func (d *Dispatcher) configRole(hashHex string) Role {
+	switch {
+	case d.Cfg.IsAdmin(hashHex):
+		return RoleAdmin
+	case d.Cfg.IsMod(hashHex):
+		return RoleMod
+	default:
+		return RoleUser
+	}
 }
 
 // helpText is the /? and /help reply, tailored to the caller's role and
@@ -204,6 +244,9 @@ func helpText(c *Caller) string {
 		b.WriteString("/nick USER NAME - mod\n")
 		b.WriteString("/kick /ban /unban /path USER - mod\n")
 		b.WriteString("/announce - mod\n")
+		if c.Role == RoleAdmin {
+			b.WriteString("/usermode ROLE USER - admin\n")
+		}
 		b.WriteString("USER = nick or hex (>=4)")
 	} else if c.Member {
 		// regular member sees the legend so /nick NAME is unambiguous
@@ -518,6 +561,66 @@ func (d *Dispatcher) handleNick(c *Caller, args []string) string {
 		}
 		return "Usage: /nick <newname>   or   /nick <user> <newname>   (no spaces in either argument)"
 	}
+}
+
+// handleUserMode implements /usermode <admin|mod|user> <user> — an
+// admin-only command to grant or clear a runtime role. The granted role
+// is stored on the roster member and RAISES (never lowers) the config
+// floor: demoting a config-granted admin/mod from chat is intentionally
+// impossible, so when the floor wins the reply says so and points at the
+// config file.
+func (d *Dispatcher) handleUserMode(c *Caller, args []string) string {
+	if c.Role != RoleAdmin {
+		return "Only admins can change roles."
+	}
+	if len(args) != 2 {
+		return "Usage: /usermode <admin|mod|user> <user>"
+	}
+	requested := strings.ToLower(args[0])
+	switch requested {
+	case "admin", "mod", "user":
+	default:
+		return "Role must be admin, mod, or user."
+	}
+	target, err := d.Roster.Resolve(args[1])
+	if err != nil {
+		return err.Error()
+	}
+	reqRole := parseRole(requested) // "user" -> RoleUser
+
+	// Self-lockout guard: an admin can't strip their OWN admin powers
+	// from chat unless the config still grants them admin (in which case
+	// it's a no-op on their effective role anyway, handled below).
+	if target.Hash == c.Hash && reqRole < RoleAdmin && d.configRole(c.Hash) < RoleAdmin {
+		return "You can't remove your own admin role. Ask another admin, or edit the config."
+	}
+
+	// Persist the runtime grant. "user" clears it (empty string).
+	rosterVal := requested
+	if requested == "user" {
+		rosterVal = ""
+	}
+	if err := d.Roster.SetRole(target.Hash, rosterVal); err != nil {
+		return "Couldn't set role: " + err.Error()
+	}
+
+	label := target.Nickname
+	if label == "" {
+		label = target.Hash[:8]
+	}
+
+	// Effective role = max(config floor, requested). If the floor wins,
+	// the change didn't fully take and the admin should know why.
+	floor := d.configRole(target.Hash)
+	effective := reqRole
+	if floor > effective {
+		effective = floor
+	}
+	if effective > reqRole {
+		return fmt.Sprintf("%s is %s via the config file, so their effective role stays %s. Edit the config to lower it.",
+			label, roleName(floor), roleName(effective))
+	}
+	return fmt.Sprintf("Set %s's role to %s.", label, roleName(effective))
 }
 
 func (d *Dispatcher) handleKick(role Role, args []string) string {

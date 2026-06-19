@@ -139,7 +139,8 @@ messages addressed to a destination hash, deliverable opportunistically
   `/users` replies on big rosters, long chat messages, etc.).
 - **Mod / admin moderation.** Config-file `admins` and `mods` lists
   get `/kick`, `/ban`, `/unban`, `/announce`, `/path`, and the
-  cross-user form of `/nick`.
+  cross-user form of `/nick`. Admins can also grant/clear roles at
+  runtime with `/usermode` — no config edit or restart.
 - **Bind-once identity.** Embed your identity in `config.toml` via
   `identity_b64` and the config file is the single source of truth —
   reinstall on any machine, same destination hash, same chat for
@@ -283,10 +284,26 @@ everything.
 | `/unban <user>`           | mods, admins | Remove from banlist |
 | `/announce`               | mods, admins | Broadcast a fresh Reticulum announce immediately |
 | `/path <user>`            | mods, admins | Show what the transport knows about reaching `<user>`: cached announce age, hop count, next-hop transport_id, whether an Active Link is open. Mostly for troubleshooting delivery problems. |
+| `/usermode <admin\|mod\|user> <user>` | admins | Grant or clear a runtime role for a roster member — no config edit or restart needed. `admin`/`mod` promote; `user` clears the runtime grant. |
 
 `<user>` accepts a **nickname** (case-insensitive) or a
 **destination-hash prefix** (≥ 4 hex chars). When two members would
 match the prefix, the daemon refuses with a disambiguation reply.
+
+**`/usermode` and the config lists.** A runtime role only ever *raises*
+the role granted by the config `admins`/`mods` lists — it never lowers
+it. The effective role is `max(config role, runtime role)`. So:
+
+- `/usermode mod Alice` promotes a regular member to mod; `/usermode
+  user Alice` clears that grant again.
+- A role granted in the config file **cannot be demoted from chat** — if
+  you `/usermode user` someone who is a config admin/mod, the daemon
+  tells you their effective role is unchanged and to edit the config.
+  This is deliberate: you can't strip a config-defined admin's powers
+  from inside the room.
+- Runtime grants persist in the roster state file across restarts.
+- An admin can't clear their own runtime admin grant (anti-lockout); a
+  config-defined admin is inherently safe.
 
 ### Examples
 

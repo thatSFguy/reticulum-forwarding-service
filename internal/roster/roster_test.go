@@ -257,6 +257,47 @@ func TestSetTextOnlyRejectsNonMember(t *testing.T) {
 	}
 }
 
+func TestSetRolePersistsAndRoundTrips(t *testing.T) {
+	r, dir := newTestRoster(t)
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), time.Now())
+
+	if err := r.SetRole(hashA, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := r.Get(hashA); u.Role != "admin" {
+		t.Errorf("role = %q, want admin", u.Role)
+	}
+
+	// Reload from disk — the role must survive a restart.
+	r2, err := New(NewStore(filepath.Join(dir, "state.json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, ok := r2.Get(hashA); !ok || u.Role != "admin" {
+		t.Errorf("after reload role = %q (ok=%v), want admin", u.Role, ok)
+	}
+
+	// Clearing back to "" drops the field.
+	if err := r.SetRole(hashA, ""); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := r.Get(hashA); u.Role != "" {
+		t.Errorf("role after clear = %q, want empty", u.Role)
+	}
+}
+
+func TestSetRoleRejectsNonMemberAndInvalid(t *testing.T) {
+	r, _ := newTestRoster(t)
+
+	if err := r.SetRole(hashA, "mod"); err == nil {
+		t.Error("SetRole on a non-member should error")
+	}
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), time.Now())
+	if err := r.SetRole(hashA, "boss"); err == nil {
+		t.Error("SetRole with an invalid role string should error")
+	}
+}
+
 func TestPersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	storePath := filepath.Join(dir, "state.json")
