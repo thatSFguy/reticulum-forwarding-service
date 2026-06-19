@@ -718,15 +718,19 @@ implement against it.
 4. **Attribute by the originator stamp.** So reactions aren't all
    attributed to the relay, `fwdsvc` stamps the reactor's `source_hash`
    into custom fields. When a received reaction carries
-   `fields[0xFB] == "originator-identity"` (exact UTF-8) and
-   `fields[0xFC]` (the reactor's raw **16-byte `source_hash`** — its
-   `lxmf.delivery` destination hash, the same value a direct reaction
-   carries and what contacts are keyed by, per SPEC §5.9.8 / §9.1; **not**
-   the identity hash, which would orphan the lookup), attribute /
-   aggregate by that hash instead of the carrying `source_hash`; fall
-   back to `source_hash` when the stamp is absent. Aggregate by
-   `(reactor-identity, reaction-content)`. Full convention:
-   [`docs/reaction-attribution.md`](docs/reaction-attribution.md).
+   `fields[0xFB] == "originator-identity"` (exact UTF-8) and a
+   **well-formed** `fields[0xFC]` (the reactor's raw **16-byte
+   `source_hash`** — its `lxmf.delivery` destination hash, the same value
+   a direct reaction carries and what contacts are keyed by, per SPEC
+   §5.9.8 / §9.1; **not** the identity hash, which would orphan the
+   lookup), attribute / aggregate by that hash instead of the carrying
+   `source_hash`; fall back to `source_hash` when the stamp is absent.
+   ⚠️ The stamp is **unauthenticated** — honor it **only** when the
+   reaction arrived via a **trusted relay** (e.g. the source that
+   delivered the reacted-to message), and validate `0xFC` is 16 bytes,
+   else a direct peer can forge attribution to anyone. Aggregate by
+   `(reactor-identity, reaction-content)`. Full convention + the trust
+   rules: [`docs/reaction-attribution.md`](docs/reaction-attribution.md).
 
 Target binding "just works": the relay rewrites the reaction's target
 `message_id` per recipient (each member computed a different id for the

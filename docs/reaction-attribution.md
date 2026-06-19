@@ -100,28 +100,54 @@ Full field map of a re-originated reaction:
 
 ### Receiver (client) behaviour
 
-When you receive a reaction (`fields[0x40]` present):
+When you receive a reaction (`fields[0x40]` present), honor the stamp
+only when **all** of these hold; otherwise attribute by the carrying
+message's `source_hash` as today:
 
-- If `fields[0xFB] == "originator-identity"` and `fields[0xFC]` is
-  present, **attribute/aggregate the reaction to the `source_hash` in
-  `0xFC`**, not to the carrying message's `source_hash`. The `0xFC` value
-  is in the same hash space as a direct reaction's `source_hash`, so it
-  resolves against your contacts (keyed by destination hash, §9.1) with
-  no special handling.
-- Otherwise, attribute by `source_hash` as today.
+1. `fields[0xFB] == "originator-identity"` (exact UTF-8), and
+2. `fields[0xFC]` is a **well-formed** reactor `source_hash` — exactly a
+   16-byte value (32 hex chars after the serializer's hex-encoding).
+   Reject blank / wrong-length / non-hex values (don't let them become an
+   unresolvable attribution key), and
+3. **the reaction provably arrived via a trusted relay** — see Security.
+   Concretely: the carrying message's `source_hash` is the relay/group
+   source that delivered the message being reacted to.
 
-Aggregate by `(reactor-identity, REACTION_CONTENT)` per §5.9.8, where
-`reactor-identity` is the `0xFC` `source_hash` when present, else the
-carrying message's `source_hash`.
+When honored, attribute/aggregate by the `0xFC` `source_hash`. It's in
+the same hash space as a direct reaction's `source_hash`, so it resolves
+against your contacts (keyed by destination hash, §9.1) with no special
+handling. Aggregate by `(reactor-identity, REACTION_CONTENT)` per §5.9.8,
+where `reactor-identity` is the `0xFC` value when honored, else the
+carrying `source_hash`.
 
 ## Security
 
-The relay MUST set `0xFC` from the `source_hash` it cryptographically
-verified on the inbound reaction, and MUST ignore any `0xFB`/`0xFC` a
-client included on the inbound message (fwdsvc does this by keeping
-`0xFB`/`0xFC`/`0xFD` out of its forward allowlist, so client-supplied
-values are stripped before the relay stamps its own). Otherwise a client
-could forge reactions attributed to someone else.
+The stamp is an **unauthenticated assertion** — there is no signature
+binding `0xFC` to the reactor. Its trust comes entirely from the relay:
+a re-originating relay verifies the reactor's LXMF signature on the
+inbound reaction before stamping, so a member trusts the relay's
+attribution the same way it already trusts the relay's `[Nick]` prefix on
+relayed text.
+
+Two MUSTs follow, one per side:
+
+- **Relay (sender):** MUST set `0xFC` from the `source_hash` it
+  cryptographically verified on the inbound reaction, and MUST ignore any
+  `0xFB`/`0xFC` a client put on the inbound message (fwdsvc keeps
+  `0xFB`/`0xFC`/`0xFD` out of its forward allowlist, so client-supplied
+  values are stripped before it stamps its own).
+
+- **Receiver (client):** MUST NOT honor the stamp on a reaction that did
+  **not** arrive via a trusted relay. Because the stamp is unsigned, a
+  *direct* peer can set `0xFB`/`0xFC` to attribute a reaction to an
+  arbitrary third party; honoring it unconditionally lets any peer forge
+  reactions as anyone (e.g. spoofing "Charlie reacted" by direct-sending
+  a stamped reaction targeting a message Charlie can see). Gate the
+  override on the carrying `source_hash` being a trusted relay — e.g. the
+  same source that delivered the reacted-to message, or an operator/
+  user-confirmed relay. A stamp from any other source MUST be discarded
+  and attribution MUST fall back to `source_hash`. (This is no weaker
+  than relayed text, where authorship is likewise relay-asserted.)
 
 ## Backward compatibility
 
