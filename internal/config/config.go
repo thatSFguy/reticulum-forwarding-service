@@ -53,6 +53,16 @@ type ServiceConfig struct {
 	HistoryPath      string   `toml:"history_path"`
 	LogPath          string   `toml:"log_path"`
 	PruneAfter       Duration `toml:"prune_after"`
+
+	// PruneSilentAfter removes members who have not sent a chat message in
+	// this window, IGNORING announces AND commands — i.e. lurkers who joined
+	// and went quiet but whose Reticulum client keeps re-announcing in the
+	// background, or who only ever poke at read-only commands (so
+	// PruneAfter, which counts both as activity, never catches them).
+	// Normally set larger than PruneAfter (e.g. prune_after = "4w",
+	// prune_silent_after = "6w"). 0 disables the silent sweep.
+	PruneSilentAfter Duration `toml:"prune_silent_after"`
+
 	PruneInterval    Duration `toml:"prune_interval"`
 	AnnounceInterval Duration `toml:"announce_interval"`
 
@@ -197,6 +207,7 @@ func defaults() *Config {
 			StatePath:        "~/.fwdsvc/state.json",
 			HistoryPath:      "~/.fwdsvc/history.json",
 			PruneAfter:       Duration(4 * 7 * 24 * time.Hour),
+			PruneSilentAfter: Duration(6 * 7 * 24 * time.Hour),
 			PruneInterval:    Duration(1 * time.Hour),
 			AnnounceInterval:   Duration(10 * time.Minute),
 			MaxInboundChars:    500,
@@ -235,6 +246,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.PruneAfter.Std() <= 0 {
 		return fmt.Errorf("service.prune_after must be positive")
+	}
+	if c.Service.PruneSilentAfter.Std() < 0 {
+		return fmt.Errorf("service.prune_silent_after must be >= 0 (0 disables)")
 	}
 	if c.Service.AnnounceInterval.Std() <= 0 {
 		return fmt.Errorf("service.announce_interval must be positive")

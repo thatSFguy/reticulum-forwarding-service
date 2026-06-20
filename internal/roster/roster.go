@@ -16,6 +16,16 @@ type User struct {
 	LastAnnounceAt time.Time `json:"last_announce_at,omitempty"`
 	LastMessageAt  time.Time `json:"last_message_at,omitempty"`
 
+	// LastCommandAt records the last time we saw any inbound traffic from
+	// the member that ISN'T a forwarded chat message — a command (/list,
+	// /nick, …), an over-limit message, or a message while paused. It keeps
+	// a demonstrably present member off the idle-prune sweep (LastSeen) but
+	// deliberately does NOT count toward LastSpoke, so running commands can
+	// never save a lurker from the silent-prune sweep. (/join is the one
+	// "command" that still counts as speaking — it goes through AddOrUpdate,
+	// which sets LastMessageAt.)
+	LastCommandAt time.Time `json:"last_command_at,omitempty"`
+
 	// Paused: when true, the forwarder skips this user when fanning out
 	// messages, and rejects their non-command messages with a "you're
 	// paused" reply rather than forwarding. Toggled via /pause /resume.
@@ -53,6 +63,28 @@ func (u User) LastSeen() time.Time {
 	}
 	if u.LastAnnounceAt.After(last) {
 		last = u.LastAnnounceAt
+	}
+	if u.LastCommandAt.After(last) {
+		last = u.LastCommandAt
+	}
+	return last
+}
+
+// LastSpoke reports the most recent moment the user contributed a chat
+// message to the group (or joined). It deliberately IGNORES both announces
+// AND commands: a member whose Reticulum client keeps re-announcing in the
+// background, or who only ever runs read-only commands like /list, but who
+// never actually says anything, still registers as silent. This is what the
+// silent-prune policy keys on, so a lurker who joined and went quiet is
+// swept even while their client is on the air and they poke at commands.
+//
+// JoinedAt is a floor for the same reason as in LastSeen — a member loaded
+// from a state file predating last_message_at carries a zero LastMessageAt
+// and must fall back to their join time rather than the epoch.
+func (u User) LastSpoke() time.Time {
+	last := u.JoinedAt
+	if u.LastMessageAt.After(last) {
+		last = u.LastMessageAt
 	}
 	return last
 }
@@ -110,13 +142,38 @@ func (r *Roster) AddOrUpdate(hashBytes []byte, now time.Time) (bool, error) {
 	return !exists, r.persistLocked()
 }
 
-// Touch refreshes last_message_at for an existing member so Prune
-// counts them as active. Unlike AddOrUpdate it never creates a user —
-// it's a no-op for non-members (returns false). Used for any inbound
-// traffic from a member that isn't itself a forwardable message
-// (commands, and messages from paused members), so a demonstrably
-// present user isn't swept for inactivity.
+// Touch refreshes last_command_at for an existing member so the idle-prune
+// sweep (LastSeen) counts them as present. Unlike AddOrUpdate it never
+// creates a user — it's a no-op for non-members (returns false). Used for
+// any inbound traffic from a member that isn't a forwarded chat message
+// (commands, over-limit messages, messages while paused).
+//
+// Crucially it does NOT touch last_message_at, so this kind of traffic does
+// not count toward LastSpoke — a member who only ever runs commands is
+// still eligible for the silent-prune sweep. Use MarkMessage for an actual
+// chat message.
 func (r *Roster) Touch(hashBytes []byte, now time.Time) (bool, error) {
+	h, err := normalizeHash(hashBytes)
+	if err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[h]
+	if !ok {
+		return false, nil
+	}
+	u.LastCommandAt = now
+	return true, r.persistLocked()
+}
+
+// MarkMessage refreshes last_message_at for an existing member — the signal
+// that they contributed an actual chat message to the group. This is the
+// only inbound path (besides /join's AddOrUpdate) that counts toward
+// LastSpoke, and so the only one that resets the silent-prune clock. Like
+// Touch it never creates a user (non-members are invited, not auto-joined);
+// it's a no-op returning false for a non-member.
+func (r *Roster) MarkMessage(hashBytes []byte, now time.Time) (bool, error) {
 	h, err := normalizeHash(hashBytes)
 	if err != nil {
 		return false, err
@@ -133,7 +190,18 @@ func (r *Roster) Touch(hashBytes []byte, now time.Time) (bool, error) {
 
 // UpdateLastAnnounce only refreshes existing users; announces from
 // non-members do not auto-join (that's reserved for actual messages).
-func (r *Roster) UpdateLastAnnounce(hashBytes []byte, now time.Time) error {
+//
+// `at` is the announce's EMISSION time (decoded from the signed
+// random_hash), not the moment we received it — see announceTap.OnAnnounce.
+// The update is monotonic: it only ever advances last_announce_at, never
+// moves it backward. This is what defeats stale-announce replay. Reticulum
+// transport nodes legitimately re-emit cached announces (path responses,
+// retransmits) long after the original announcer is gone; those replays
+// carry the original, old emission time, so taking the max means a replay
+// can't make a long-dead identity look freshly active and dodge Prune.
+// As a bonus it skips the disk write entirely when a replay doesn't
+// advance the timestamp.
+func (r *Roster) UpdateLastAnnounce(hashBytes []byte, at time.Time) error {
 	h, err := normalizeHash(hashBytes)
 	if err != nil {
 		return err
@@ -144,19 +212,40 @@ func (r *Roster) UpdateLastAnnounce(hashBytes []byte, now time.Time) error {
 	if !ok {
 		return nil
 	}
-	u.LastAnnounceAt = now
+	if !at.After(u.LastAnnounceAt) {
+		return nil
+	}
+	u.LastAnnounceAt = at
 	return r.persistLocked()
 }
 
-// Prune removes any user whose last_seen is older than `now - cutoff`.
+// Prune removes a user when EITHER inactivity rule fires:
+//
+//   - idle: their LastSeen (message, command, OR announce) is older than
+//     now-idleCutoff. This sweeps members who have left the network
+//     entirely — nothing has been heard from them or their client.
+//
+//   - silent: their LastSpoke (message or command, IGNORING announces) is
+//     older than now-silentCutoff. This sweeps lurkers who joined and went
+//     quiet but whose client keeps announcing, so the idle rule alone would
+//     never catch them. Disabled when silentCutoff <= 0.
+//
+// silentCutoff is normally the larger window (e.g. idle 4w, silent 6w):
+// a member who is both gone and silent is caught by the shorter idle rule
+// first; the silent rule only adds value for members who are present
+// (announcing) but contribute nothing.
+//
 // Returns the hashes pruned.
-func (r *Roster) Prune(now time.Time, cutoff time.Duration) ([]string, error) {
+func (r *Roster) Prune(now time.Time, idleCutoff, silentCutoff time.Duration) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	threshold := now.Add(-cutoff)
+	idleThreshold := now.Add(-idleCutoff)
+	silentThreshold := now.Add(-silentCutoff)
 	var pruned []string
 	for h, u := range r.users {
-		if u.LastSeen().Before(threshold) {
+		idle := u.LastSeen().Before(idleThreshold)
+		silent := silentCutoff > 0 && u.LastSpoke().Before(silentThreshold)
+		if idle || silent {
 			delete(r.users, h)
 			pruned = append(pruned, h)
 		}

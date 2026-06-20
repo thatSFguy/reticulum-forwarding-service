@@ -46,6 +46,13 @@ history_path  = "~/.fwdsvc/history.json"
 # them in this long.
 prune_after = "4w"
 
+# Drop a member who hasn't sent a chat message in this long, EVEN IF their
+# Reticulum client is still announcing or they run the occasional command.
+# Catches lurkers who joined and went quiet (prune_after counts announces
+# and commands as activity, so it never sweeps them). Note: /join resets
+# this clock. Set larger than prune_after. 0 disables the silent sweep.
+prune_silent_after = "6w"
+
 # How often to run the prune sweep.
 prune_interval = "1h"
 

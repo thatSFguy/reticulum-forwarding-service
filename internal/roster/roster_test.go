@@ -55,7 +55,7 @@ func TestPruneRespectsCutoff(t *testing.T) {
 	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-5*7*24*time.Hour)) // 5 weeks ago
 	_, _ = r.AddOrUpdate(mustHash(t, hashB), t0.Add(-1*time.Hour))      // recent
 
-	pruned, err := r.Prune(t0, 4*7*24*time.Hour)
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,12 +78,97 @@ func TestPruneRespectsAnnounceFreshness(t *testing.T) {
 	// announced recently — should keep them alive even though no recent message
 	_ = r.UpdateLastAnnounce(mustHash(t, hashA), t0.Add(-1*time.Hour))
 
-	pruned, err := r.Prune(t0, 4*7*24*time.Hour)
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pruned) != 0 {
 		t.Errorf("expected nothing pruned, got %v", pruned)
+	}
+}
+
+func TestPruneSilentSweepsAnnouncingLurker(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	// A lurker who joined 7 weeks ago, never sent another message, but whose
+	// client keeps announcing (last announce an hour ago). The idle rule
+	// counts the announce as activity and keeps them, but the silent rule
+	// (6w, keyed on LastSpoke which ignores announces) must sweep them.
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-7*7*24*time.Hour))
+	_ = r.UpdateLastAnnounce(mustHash(t, hashA), t0.Add(-1*time.Hour))
+
+	// A regular who spoke 2 weeks ago — under both windows, must survive.
+	_, _ = r.AddOrUpdate(mustHash(t, hashB), t0.Add(-2*7*24*time.Hour))
+
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour, 6*7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 1 || pruned[0] != hashA {
+		t.Errorf("expected silent lurker %s pruned, got %v", hashA, pruned)
+	}
+	if !r.Has(mustHash(t, hashB)) {
+		t.Error("recently-active member should not be pruned by the silent rule")
+	}
+}
+
+func TestPruneSilentDisabledWhenZero(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	// Silent for 7 weeks but announcing recently. With silentCutoff == 0 the
+	// silent rule is off, so the recent announce keeps them via the idle rule.
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-7*7*24*time.Hour))
+	_ = r.UpdateLastAnnounce(mustHash(t, hashA), t0.Add(-1*time.Hour))
+
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("silent rule disabled — expected nothing pruned, got %v", pruned)
+	}
+}
+
+func TestUpdateLastAnnounceIsMonotonic(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-7*7*24*time.Hour))
+
+	// A genuine recent announce sets a fresh timestamp.
+	if err := r.UpdateLastAnnounce(mustHash(t, hashA), t0.Add(-1*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// A replayed OLD announce (its emission time predates the fresh one)
+	// must NOT regress the timestamp.
+	if err := r.UpdateLastAnnounce(mustHash(t, hashA), t0.Add(-6*7*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	u, ok := r.Get(hashA)
+	if !ok {
+		t.Fatal("user missing")
+	}
+	if !u.LastAnnounceAt.Equal(t0.Add(-1 * time.Hour)) {
+		t.Errorf("LastAnnounceAt = %v, want the fresher %v (replay must not regress it)", u.LastAnnounceAt, t0.Add(-1*time.Hour))
+	}
+}
+
+func TestLastSpokeIgnoresAnnounce(t *testing.T) {
+	joined := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	u := User{
+		JoinedAt:       joined,
+		LastMessageAt:  joined.Add(time.Hour),
+		LastAnnounceAt: joined.Add(48 * time.Hour), // much later, but an announce
+	}
+	// LastSeen follows the announce; LastSpoke ignores it and stops at the
+	// last message.
+	if !u.LastSeen().Equal(joined.Add(48 * time.Hour)) {
+		t.Errorf("LastSeen = %v, want announce time", u.LastSeen())
+	}
+	if !u.LastSpoke().Equal(joined.Add(time.Hour)) {
+		t.Errorf("LastSpoke = %v, want last message %v (announces ignored)", u.LastSpoke(), joined.Add(time.Hour))
 	}
 }
 
@@ -139,12 +224,81 @@ func TestTouchRefreshesMemberAndIgnoresNonMember(t *testing.T) {
 	if !ok {
 		t.Error("Touch on a member should report true")
 	}
-	pruned, err := r.Prune(t0, 4*7*24*time.Hour)
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pruned) != 0 {
 		t.Errorf("a recently-touched member should not be pruned, got %v", pruned)
+	}
+}
+
+func TestTouchDoesNotSaveLurkerFromSilentPrune(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	// Joined 7 weeks ago (AddOrUpdate stamps last_message_at = join time,
+	// so LastSpoke is 7w stale), then ran a command an hour ago. Touch
+	// records that command as presence only — it must NOT advance
+	// last_message_at, so the silent clock stays at the 7w-old join.
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-7*7*24*time.Hour))
+	if _, err := r.Touch(mustHash(t, hashA), t0.Add(-1*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Idle rule alone (silent disabled) keeps them — they're present.
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("command activity should keep a member off the idle sweep, got %v", pruned)
+	}
+
+	// With the 6w silent rule on, the command-only lurker is swept.
+	pruned, err = r.Prune(t0, 4*7*24*time.Hour, 6*7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 1 || pruned[0] != hashA {
+		t.Errorf("expected command-only lurker %s swept by silent rule, got %v", hashA, pruned)
+	}
+}
+
+func TestMarkMessageResetsSilentClock(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	// Joined 7 weeks ago (so the join-time last_message_at is stale), but
+	// sent a real chat message an hour ago — MarkMessage resets the silent
+	// clock, so the 6w silent rule must spare them.
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-7*7*24*time.Hour))
+	if _, err := r.MarkMessage(mustHash(t, hashA), t0.Add(-1*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour, 6*7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("a member who recently sent a real message must not be silent-pruned, got %v", pruned)
+	}
+}
+
+func TestMarkMessageDoesNotAutoJoin(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	ok, err := r.MarkMessage(mustHash(t, hashA), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("MarkMessage on a non-member should report false")
+	}
+	if r.Has(mustHash(t, hashA)) {
+		t.Error("MarkMessage must not create a non-member")
 	}
 }
 
