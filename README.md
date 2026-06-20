@@ -79,8 +79,9 @@ messages addressed to a destination hash, deliverable opportunistically
   identity's decryption, and it re-encrypts per recipient on the way
   out — same trust model as any LXMF peer.
 - Joining is by sending `/join`. Roster membership is auto-pruned for
-  anyone who's been silent (no announce, no message) for four weeks by
-  default.
+  anyone not heard from (no announce, no message) for four weeks, and for
+  lurkers who keep announcing but never send a chat message for six weeks,
+  by default.
 
 ### Glossary
 
@@ -115,8 +116,10 @@ messages addressed to a destination hash, deliverable opportunistically
   (and sending) forwards while staying on the roster. `/resume` reverses.
 - **Per-message char cap** (`max_inbound_chars`, default 500). Oversize
   non-command messages get a polite reject reply and aren't forwarded.
-- **Auto-prune.** Members silent for `prune_after` (default 4 weeks)
-  are removed automatically; they can `/join` again any time.
+- **Auto-prune.** Members not heard from for `prune_after` (default 4 weeks)
+  are removed automatically. A second window, `prune_silent_after` (default
+  6 weeks), also removes lurkers who keep announcing (or run the odd command)
+  but never send a chat message. Either way they can `/join` again any time.
 - **Forwarded content sanitised.** Bytes outside printable + TAB/LF/CR
   become `?` before forwarding — no ANSI-escape injection into other
   users' terminals.
@@ -353,7 +356,8 @@ Both lists MUST be declared at the top of the file, before any
 | `state_path`         | path     | `~/.fwdsvc/state.json`      | Roster + banlist. |
 | `history_path`       | path     | `~/.fwdsvc/history.json`    | Replay ring buffer. |
 | `log_path`           | path     | unset                       | If set, append the daemon log to this file (in addition to stdout). |
-| `prune_after`        | duration | `"4w"`                      | Drop a member who's been silent (no announce, no message) for this long. |
+| `prune_after`        | duration | `"4w"`                      | Drop a member we haven't heard from (no announce, no message) for this long. |
+| `prune_silent_after` | duration | `"6w"`                      | Drop a member who hasn't sent a chat message in this long, even if still announcing or running commands (`/join` resets it). `0` disables. |
 | `prune_interval`     | duration | `"1h"`                      | How often the prune sweep runs. |
 | `announce_interval`  | duration | `"10m"`                     | How often we re-announce ourselves. |
 | `max_inbound_chars`  | int      | `500`                       | Reject non-command messages longer than this many UTF-8 chars. `0` disables. |

@@ -333,7 +333,7 @@ func (s *Service) announceNow() error {
 }
 
 func (s *Service) runPrune(now time.Time) {
-	pruned, err := s.roster.Prune(now, s.cfg.Service.PruneAfter.Std())
+	pruned, err := s.roster.Prune(now, s.cfg.Service.PruneAfter.Std(), s.cfg.Service.PruneSilentAfter.Std())
 	if err != nil {
 		s.logger.Printf("prune error: %v", err)
 		return
@@ -439,7 +439,20 @@ func (t *announceTap) AspectMatch(nameHash []byte) bool {
 }
 
 func (t *announceTap) OnAnnounce(a *rns.Announce) {
-	if err := t.svc.roster.UpdateLastAnnounce(a.DestHash, t.svc.now()); err != nil {
+	// Stamp the announce's own SIGNED emission time (from random_hash), not
+	// our receive time. A transport node may replay a cached announce (path
+	// response, retransmit) long after the announcer is gone; that replay is
+	// validly signed but carries its original, old timestamp. Recording it
+	// as "now" would keep a long-dead identity looking active forever and
+	// defeat Prune. EmittedAt is inside signed_data, so it can't be forged.
+	// Clamp to now so a future-dated (clock-skewed) announce can't push the
+	// timestamp ahead of real time; UpdateLastAnnounce itself is monotonic.
+	now := t.svc.now()
+	at := now
+	if emitted, err := a.EmittedAt(); err == nil && !emitted.After(now) {
+		at = emitted
+	}
+	if err := t.svc.roster.UpdateLastAnnounce(a.DestHash, at); err != nil {
 		t.svc.logger.Printf("announce update: %v", err)
 	}
 	t.maybeAdoptAnnouncedNickname(a)

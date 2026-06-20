@@ -46,12 +46,17 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		s.logger.Printf("new sender contact: full dest_hash = %s", senderHex)
 	}
 
-	// Any inbound traffic from a member — a command, an over-limit
-	// message, or a message from a paused member — counts as activity so
-	// Prune doesn't sweep a demonstrably present user. Most of those
-	// paths return before the forward step below, so the refresh has to
-	// happen up here. No-op for non-members (they must /join before
-	// anything counts).
+	// Any inbound traffic from a member — a command, an over-limit message,
+	// or a message from a paused member — counts as PRESENCE so the
+	// idle-prune sweep doesn't drop a demonstrably-present user. Most of
+	// those paths return before the forward step below, so the refresh has
+	// to happen up here. No-op for non-members (they must /join first).
+	//
+	// This is deliberately NOT last_message_at: presence keeps the idle
+	// sweep away but must not reset the silent-prune clock, otherwise a
+	// lurker could dodge the silent sweep forever just by running commands.
+	// An actual forwarded chat message bumps last_message_at via
+	// MarkMessage further down.
 	if _, err := s.roster.Touch(senderBytes, now); err != nil {
 		s.logger.Printf("roster touch: %v", err)
 	}
@@ -96,9 +101,13 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		return
 	}
 
-	// last_message_at was already refreshed by the Touch above (which
-	// runs for every member, paused or not), so the forward path doesn't
-	// need to re-update the roster here.
+	// This is a genuine chat message from a member: stamp last_message_at
+	// (the only signal besides /join that resets the silent-prune clock).
+	// The Touch above only recorded presence; commands never reach here.
+	if _, err := s.roster.MarkMessage(senderBytes, now); err != nil {
+		s.logger.Printf("roster mark message: %v", err)
+	}
+
 	senderUser, _ := s.roster.Get(senderHex)
 	senderNick := senderUser.Nickname
 	if senderNick == "" {

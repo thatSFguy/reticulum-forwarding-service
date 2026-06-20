@@ -36,6 +36,56 @@ func makeAnnounce(destHash []byte, displayName string) *rns.Announce {
 	return &rns.Announce{DestHash: append([]byte(nil), destHash...), AppData: appData}
 }
 
+// makeAnnounceAt builds an announce whose signed random_hash encodes the
+// given emission time, so EmittedAt() decodes back to `emitted`. The first
+// 5 bytes (entropy) are left zero — only the timestamp half matters here.
+func makeAnnounceAt(destHash []byte, emitted time.Time) *rns.Announce {
+	rh := make([]byte, 10)
+	ts := rns.BigEndianUint40(uint64(emitted.Unix()))
+	copy(rh[5:], ts[:])
+	return &rns.Announce{DestHash: append([]byte(nil), destHash...), RandomHash: rh}
+}
+
+// A replayed announce carries an OLD emission time (its original signed
+// random_hash), even though we receive it now. The tap must record that old
+// time, not our receive time — otherwise a long-gone identity whose cached
+// announce gets re-emitted by a transport node looks perpetually fresh and
+// dodges Prune.
+func TestAnnounceStampsEmittedTimeNotReceiveTime(t *testing.T) {
+	tap, r := newTestTap(t)
+	now := tap.svc.now()
+	dest := bytes.Repeat([]byte{0x11}, rns.IdentityHashLen)
+	if _, err := r.AddOrUpdate(dest, now.Add(-7*24*time.Hour)); err != nil {
+		t.Fatalf("AddOrUpdate: %v", err)
+	}
+
+	emitted := now.Add(-30 * 24 * time.Hour) // a month-old replayed announce
+	tap.OnAnnounce(makeAnnounceAt(dest, emitted))
+
+	u, _ := r.Get(hex.EncodeToString(dest))
+	if !u.LastAnnounceAt.Equal(emitted) {
+		t.Errorf("LastAnnounceAt = %v, want emission time %v (not receive time %v)", u.LastAnnounceAt, emitted, now)
+	}
+}
+
+// A future-dated announce (clock skew, or a malformed/missing timestamp)
+// must not push last_announce_at past real time.
+func TestAnnounceClampsFutureEmissionToNow(t *testing.T) {
+	tap, r := newTestTap(t)
+	now := tap.svc.now()
+	dest := bytes.Repeat([]byte{0x22}, rns.IdentityHashLen)
+	if _, err := r.AddOrUpdate(dest, now.Add(-7*24*time.Hour)); err != nil {
+		t.Fatalf("AddOrUpdate: %v", err)
+	}
+
+	tap.OnAnnounce(makeAnnounceAt(dest, now.Add(48*time.Hour)))
+
+	u, _ := r.Get(hex.EncodeToString(dest))
+	if u.LastAnnounceAt.After(now) {
+		t.Errorf("LastAnnounceAt = %v, must be clamped to now %v or earlier", u.LastAnnounceAt, now)
+	}
+}
+
 func TestAnnounceAdoptsNicknameWhenUnset(t *testing.T) {
 	tap, r := newTestTap(t)
 	dest := bytes.Repeat([]byte{0xAA}, rns.IdentityHashLen)
